@@ -1,0 +1,601 @@
+--!strict
+-- ChargeClient.client.lua
+-- แก้เคส: ได้ยิน charge_full แล้วปล่อยทันทีต้องออก catk ตามเฟสเสมอ
+-- จุดสำคัญ: นับเวลาเฟสจาก "ตอนไปสู่สถานะชาร์จจริง" (tCharge0) ให้ตรงกับฝั่งเซิร์ฟ
+
+local Players     = game:GetService("Players")
+local RS          = game:GetService("ReplicatedStorage")
+local UIS         = game:GetService("UserInputService")
+local Debris      = game:GetService("Debris")
+local RunService  = game:GetService("RunService")
+
+local plr = Players.LocalPlayer
+local ctx = require(plr.PlayerScripts:WaitForChild("ActiveWeaponContext"))
+
+-- Remotes (เดิมคงไว้ที่ใช้จริง) ----------------------------
+local Combat           = RS:WaitForChild("Remotes"):WaitForChild("Combat")
+local R_AttackIntent   = Combat:WaitForChild("AttackIntent")
+local R_AttackWindow   = Combat:WaitForChild("AttackWindow")
+local R_ForceCast      = Combat:WaitForChild("ForceCast")
+local R_ChargeCtrl     = Combat:WaitForChild("ChargeCtrl")
+
+-- ✅ ใช้ชุด Shared/* สำหรับ Echo
+local Shared  = RS:WaitForChild("Shared")
+local RemVfx  = Shared:WaitForChild("VFX"):WaitForChild("VFXRemote")    :: RemoteEvent
+local RemSfx  = Shared:WaitForChild("SFX"):WaitForChild("SfxEchoRemote") :: RemoteEvent
+-- ------------------------------------------------------------
+
+-- Modules
+local FxBinder  = require(RS.Shared.FxSfxMarkerBinder)
+local SfxRouter = require(RS.Shared.SFX.SfxRouter)
+
+-- Tunables
+local MIN_CHARGE_SEC = 0.80
+local CHARGE_FADE    = 0.08
+local EPS_PHASE      = 0.12 -- กัน jitter/latency เล็กน้อย
+
+-- Per-tool (รีเฟรชตอนเปลี่ยนอาวุธ)
+local CHARGE_MOVE_ID = "charge"
+local PHASE_SEC      = 2.0
+local MAX_PHASE      = 3
+local CATK_IDS       = { "catk1", "catk2", "catk3" }
+
+local function isCatk(id: string): boolean
+	for _, v in ipairs(CATK_IDS) do
+		if v == id then return true end
+	end
+	return false
+end
+
+-- State
+local hum: Humanoid? = nil
+local animator: Animator? = nil
+local currentTool: Tool? = nil
+
+local pressed      = false
+local charging     = false
+local tPressed     = 0.0 -- เวลากดปุ่ม
+local tCharge0     = 0.0 -- ✅ เวลา "เข้าสถานะชาร์จจริง"
+local chargeTrack: AnimationTrack? = nil
+local phaseReached = 0    -- เฟสที่ยืนยันแล้วด้วยเสียง charge_full 
+local phaseLoopTask: thread? = nil
+
+local conns: {RBXScriptConnection} = {}
+local pressToken = 0
+
+----------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------
+local function ensureAnimator(h: Humanoid): Animator
+	local a = h:FindFirstChildOfClass("Animator")
+	if not a then a = Instance.new("Animator"); a.Parent = h end
+	return a
+end
+
+local function findAnim(moveId: string): Animation?
+	local f = ctx.getAnimationFolder()
+	if not f then return nil end
+	local a = f:FindFirstChild(moveId)
+	if a and a:IsA("Animation") then return a end
+	return nil
+end
+
+local function atkSpeed(): number
+	local gAtk = ctx.getAttr("GlobalAtkSpeed", nil)
+	local atk  = ctx.getAttr("AtkSpeed", nil)
+	local val  = tonumber(gAtk) or tonumber(atk) or 1
+	return math.clamp(val, 0.25, 3.0)
+end
+
+-- ✅ กระจาย VFX ไปหาเพื่อนด้วย VFXRemote (ท่อใหม่)
+local function vfxBroadcast(stepName: string)
+	RemVfx:FireServer(CHARGE_MOVE_ID, stepName, { sender = Players.LocalPlayer.UserId })
+end
+
+local function bindMarkersFor(moveIdOut: string, tr: AnimationTrack)
+	local open: {[number]: boolean} = {}
+	local function begin(i: number)
+		if open[i] then return end
+		open[i] = true
+		R_AttackWindow:FireServer({ moveId = moveIdOut, idx = i, phase = "begin", castTs = tick() })
+	end
+	local function endw(i: number)
+		if not open[i] then return end
+		open[i] = nil
+		R_AttackWindow:FireServer({ moveId = moveIdOut, idx = i, phase = "end", castTs = tick() })
+	end
+	tr.Stopped:Connect(function()
+		for i=1,6 do if open[i] then endw(i) end end
+	end)
+	for i=1,6 do
+		tr:GetMarkerReachedSignal(string.format("hit%d_on", i)):Connect(function() begin(i) end)
+		tr:GetMarkerReachedSignal(string.format("hit%d_off", i)):Connect(function() endw(i) end)
+	end
+	tr:GetMarkerReachedSignal("hit_on"):Connect(function() begin(1) end)
+	tr:GetMarkerReachedSignal("hit_off"):Connect(function() endw(1) end)
+end
+
+local function mkCtx(moveId: string, clipSpd: number?, tr: AnimationTrack?): any
+	return {
+		tool = currentTool,
+		character = hum and hum.Parent or nil,
+		humanoid = hum,
+		animTrack = tr,
+		moveId = moveId,
+		clipSpeed = clipSpd,
+		atkSpeed = atkSpeed(),
+		rigName = hum and hum.RigType.Name or "R15",
+	}
+end
+
+local function playLocalSfxFromTool(name: string)
+	if not currentTool then return end
+	local char = ctx.getCharacter(); if not char then return end
+	local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?; if not root then return end
+
+	local node: Instance? = currentTool
+	for seg in string.gmatch("Animations/R15/charge/sfx", "[^/]+") do
+		node = node and node:FindFirstChild(seg)
+	end
+	local snd = node and node:FindFirstChild(name)
+	if snd and snd:IsA("Sound") then
+		local clone = snd:Clone()
+		clone.Looped = false
+		clone.Parent = root
+		clone:Play()
+		Debris:AddItem(clone, math.max(0.6, clone.TimeLength + 0.25))
+	end
+end
+
+local function echoSfxToOthers(name: string, range: number?)
+	RemSfx:FireServer({ name = name, path = "Animations/R15/charge/sfx", range = range or 80 })
+end
+
+-- ✅ เล่น VFX ฝั่งเราให้ชัวร์ (ลอง "phaseX" ก่อน แล้วค่อย "phase")
+--    ใช้ Runner กลาง (Shared/VFX/VfxRunner) เป็นหลัก; ถ้าไม่พบค่อย fallback ไปที่ Tool.VFX
+local function playChargeVfxStep(stepName: string, phaseIdx: number?)
+	if not currentTool then return end
+
+	-- Runner กลาง (catalog/registry)
+	local okR, Runner = pcall(function() return require(RS.Shared.VFX.VfxRunner) end)
+	if okR and Runner and (Runner :: any).play then
+		-- ถ้าเป็นเฟส: ลอง phaseX ก่อน
+		if phaseIdx and phaseIdx >= 1 then
+			pcall(function()
+				(Runner :: any).play(currentTool :: Tool, CHARGE_MOVE_ID, ("phase%d"):format(phaseIdx), {})
+			end)
+		end
+		pcall(function()
+			(Runner :: any).play(currentTool :: Tool, CHARGE_MOVE_ID, stepName, {})
+		end)
+		return
+	end
+
+	-- Fallback: Runner ใน Tool (เผื่อโปรเจ็กต์ของคุณใช้แบบนี้อยู่)
+	local vfxFolder = currentTool:FindFirstChild("VFX")
+	if vfxFolder then
+		local ok, runner = pcall(function() return require(vfxFolder:WaitForChild("VfxRunner")) end)
+		if ok and runner and runner.play then
+			if phaseIdx and phaseIdx >= 1 then
+				pcall(function() runner.play(currentTool :: Tool, CHARGE_MOVE_ID, ("phase%d"):format(phaseIdx), {}) end)
+			end
+			pcall(function() runner.play(currentTool :: Tool, CHARGE_MOVE_ID, stepName, {}) end)
+		end
+	end
+end
+
+local function cast(moveId: string)
+	if not hum or not hum.Parent then return end
+	animator = ensureAnimator(hum)
+	local a = findAnim(moveId); if not a then return end
+	local clipSpd = tonumber(a:GetAttribute("ClipSpeed")) or 1
+	local spd = math.clamp(atkSpeed() * clipSpd, 0.25, 3.0)
+
+	local tr = animator:LoadAnimation(a)
+	tr.Priority = Enum.AnimationPriority.Action
+
+	FxBinder.Attach({
+		tool = currentTool, moveId = moveId, track = tr,
+		character = hum and hum.Parent or nil, humanoid = hum,
+		atkSpeed = atkSpeed(), clipSpeed = clipSpd,
+	})
+
+	bindMarkersFor(moveId, tr)
+	R_AttackIntent:FireServer({ moveId = moveId, castTs = tick() })
+	tr:Play(0.03, 1, spd)
+end
+
+----------------------------------------------------------------
+-- อ่านคอนฟิกจาก MoveSpec (เป็นหลัก) + fallback attribute เดิม
+----------------------------------------------------------------
+-- อ่านคอนฟิกจาก MoveSpec (RETURN ค่า; ไม่แก้ state ตรง ๆ)
+local function readChargeSpecFromMoveSpec()
+	local tool = currentTool
+	if not tool then return nil end
+	local ms = tool:FindFirstChild("MoveSpec") :: ModuleScript?
+	if not (ms and ms:IsA("ModuleScript")) then return nil end
+
+	local ok, Mod = pcall(require, ms)
+	if not ok or type(Mod) ~= "table" then return nil end
+
+	local get = (Mod :: any).GetChargeSpec
+	local src: any = (type(get) == "function") and get() or (Mod :: any).charge
+	if type(src) ~= "table" then return nil end
+
+	local spec: any = {}
+
+	-- moveId / vfxMoveId (อย่างใดอย่างหนึ่ง)
+	if type(src.moveId) == "string" and src.moveId ~= "" then
+		spec.moveId = src.moveId
+	end
+	if type(src.vfxMoveId) == "string" and src.vfxMoveId ~= "" then
+		spec.vfxMoveId = src.vfxMoveId
+	end
+
+	-- เวลา/จำนวนเฟส
+	local ps = tonumber(src.phaseSec or src.timeSec or src.phaseTime)
+	if ps then spec.phaseSec = ps end
+
+	local mx = tonumber(src.max or src.maxPhase or src.phaseMax)
+	if mx then spec.max = math.max(1, math.floor(mx)) end
+
+	-- mapping ท่าที่ปล่อยต่อเฟส
+	if type(src.map) == "table" then
+		local m1 = src.map[1] or src.map.catk1 or src.map.phase1
+		local m2 = src.map[2] or src.map.catk2 or src.map.phase2
+		local m3 = src.map[3] or src.map.catk3 or src.map.phase3
+		spec.map = { tostring(m1 or "catk1"), tostring(m2 or "catk2"), tostring(m3 or "catk3") }
+	else
+		local m1, m2, m3 = src.catk1, src.catk2, src.catk3
+		if m1 or m2 or m3 then
+			spec.map = { tostring(m1 or "catk1"), tostring(m2 or "catk2"), tostring(m3 or "catk3") }
+		end
+	end
+
+	-- (ออปชัน) ระยะ echo
+	local er = tonumber(src.echoRange or src.ChargeEchoRange)
+	if er then spec.echoRange = er end
+
+	return spec
+end
+
+-- ใช้ MoveSpec เป็น "ตัวหลัก" อย่างแท้จริง; Attribute เป็น fallback เท่านั้น
+local function refreshChargeConfig()
+	-- 1) ค่าพื้นฐาน
+	CHARGE_MOVE_ID = "charge"
+	PHASE_SEC      = 2.0
+	MAX_PHASE      = 3
+	CATK_IDS       = { "catk1", "catk2", "catk3" }
+
+	-- 2) เติมจาก Attribute เป็นค่าเริ่ม (fallback)
+	local aMoveId = ctx.getAttr("ChargeMoveId", nil)
+	if aMoveId then CHARGE_MOVE_ID = tostring(aMoveId) end
+
+	local aPhase  = tonumber(ctx.getAttr("ChargeTimeSec", nil))
+	if aPhase then PHASE_SEC = aPhase end
+
+	local aMax    = tonumber(ctx.getAttr("ChargeMaxPhase", nil))
+	if aMax then MAX_PHASE = math.max(1, math.floor(aMax)) end
+
+	local a1 = ctx.getAttr("ChargeFullAttackId",   nil); if a1 then CATK_IDS[1] = tostring(a1) end
+	local a2 = ctx.getAttr("ChargePhase2AttackId", nil); if a2 then CATK_IDS[2] = tostring(a2) end
+	local a3 = ctx.getAttr("ChargePhase3AttackId", nil); if a3 then CATK_IDS[3] = tostring(a3) end
+
+	-- 3) ✅ Authoritative: MoveSpec ทับค่า (ถ้ามี field ใดให้มา จะ "ชนะ" ค่าเดิม)
+	local spec = readChargeSpecFromMoveSpec()
+	if spec then
+		if type(spec.moveId) == "string" and spec.moveId ~= "" then
+			CHARGE_MOVE_ID = spec.moveId
+		elseif type(spec.vfxMoveId) == "string" and spec.vfxMoveId ~= "" then
+			CHARGE_MOVE_ID = spec.vfxMoveId
+		end
+
+		if tonumber(spec.phaseSec) then
+			PHASE_SEC = tonumber(spec.phaseSec)
+		end
+
+		if tonumber(spec.max) then
+			MAX_PHASE = math.max(1, math.floor(tonumber(spec.max)))
+		end
+
+		if type(spec.map) == "table" then
+			CATK_IDS[1] = tostring(spec.map[1] or CATK_IDS[1])
+			CATK_IDS[2] = tostring(spec.map[2] or CATK_IDS[2])
+			CATK_IDS[3] = tostring(spec.map[3] or CATK_IDS[3])
+		end
+	end
+end
+
+
+local function refreshChargeConfig()
+	-- 1) ค่าพื้นฐาน
+	CHARGE_MOVE_ID = "charge"
+	PHASE_SEC      = 2.0
+	MAX_PHASE      = 3
+	CATK_IDS       = { "catk1", "catk2", "catk3" }
+
+	-- 2) เติมจาก Attribute เป็นค่าเริ่ม (fallback)
+	local aMoveId = ctx.getAttr("ChargeMoveId", nil)
+	if aMoveId then CHARGE_MOVE_ID = tostring(aMoveId) end
+
+	local aPhase  = tonumber(ctx.getAttr("ChargeTimeSec", nil))
+	if aPhase then PHASE_SEC = aPhase end
+
+	local aMax    = tonumber(ctx.getAttr("ChargeMaxPhase", nil))
+	if aMax then MAX_PHASE = math.max(1, math.floor(aMax)) end
+
+	local a1 = ctx.getAttr("ChargeFullAttackId",   nil); if a1 then CATK_IDS[1] = tostring(a1) end
+	local a2 = ctx.getAttr("ChargePhase2AttackId", nil); if a2 then CATK_IDS[2] = tostring(a2) end
+	local a3 = ctx.getAttr("ChargePhase3AttackId", nil); if a3 then CATK_IDS[3] = tostring(a3) end
+
+	-- 3) ✅ Authoritative: MoveSpec ทับค่า (ถ้ามี field ใดให้มา จะ "ชนะ" ค่าเดิม)
+	local spec = readChargeSpecFromMoveSpec()
+	if spec then
+		if type(spec.moveId) == "string" and spec.moveId ~= "" then
+			CHARGE_MOVE_ID = spec.moveId
+		elseif type(spec.vfxMoveId) == "string" and spec.vfxMoveId ~= "" then
+			CHARGE_MOVE_ID = spec.vfxMoveId
+		end
+
+		if tonumber(spec.phaseSec) then
+			PHASE_SEC = tonumber(spec.phaseSec)
+		end
+
+		if tonumber(spec.max) then
+			MAX_PHASE = math.max(1, math.floor(tonumber(spec.max)))
+		end
+
+		if type(spec.map) == "table" then
+			CATK_IDS[1] = tostring(spec.map[1] or CATK_IDS[1])
+			CATK_IDS[2] = tostring(spec.map[2] or CATK_IDS[2])
+			CATK_IDS[3] = tostring(spec.map[3] or CATK_IDS[3])
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- ชาร์จ: begin/stop + phase detector (อิง tCharge0)
+----------------------------------------------------------------
+local function stopChargeLoop()
+	if phaseLoopTask then task.cancel(phaseLoopTask); phaseLoopTask = nil end
+	phaseReached = 0
+
+	if chargeTrack then
+		local cs = (chargeTrack.Animation and tonumber(chargeTrack.Animation:GetAttribute("ClipSpeed"))) or 1
+		SfxRouter.PlayEnd(mkCtx(CHARGE_MOVE_ID, cs, chargeTrack))
+		pcall(function() chargeTrack:Stop(CHARGE_FADE) end)
+		chargeTrack = nil
+	end
+
+	-- ปิด VFX ฝั่งเรา + broadcast
+	playChargeVfxStep("end")
+	vfxBroadcast("end")
+end
+
+local function beginChargeLoop()
+	if not hum or not hum.Parent then return end
+	animator = ensureAnimator(hum)
+	local a = findAnim(CHARGE_MOVE_ID); if not a then return end
+
+	stopChargeLoop()
+
+	local clipSpd = tonumber(a:GetAttribute("ClipSpeed")) or 1
+	local spd = math.clamp(atkSpeed() * clipSpd, 0.25, 3.0)
+
+	local tr = animator:LoadAnimation(a)
+	tr.Priority = Enum.AnimationPriority.Action
+	tr.Looped   = true
+
+	FxBinder.Attach({
+		tool = currentTool, moveId = CHARGE_MOVE_ID, track = tr,
+		character = hum and hum.Parent or nil, humanoid = hum,
+		atkSpeed = atkSpeed(), clipSpeed = clipSpd,
+	})
+
+	tr:Play(CHARGE_FADE, 1, spd)
+	chargeTrack = tr
+
+	-- เริ่มชาร์จ: เล่นเสียง/เอฟเฟกต์ฝั่งเรา + broadcast
+	playLocalSfxFromTool("charge_on"); echoSfxToOthers("charge_on", 80)
+	playChargeVfxStep("start")
+	vfxBroadcast("start")
+
+	phaseReached = 0
+	local myToken = pressToken
+
+	-- ✅ ใช้ tCharge0 เป็นฐานเวลาชาร์จเสมอ
+	phaseLoopTask = task.spawn(function()
+		while charging and pressed and myToken == pressToken do
+			local base = (tCharge0 > 0) and tCharge0 or tPressed -- กันเผื่อ
+			local held = math.max(0, tick() - base)
+			local idx  = math.clamp(math.floor((held + EPS_PHASE) / PHASE_SEC), 0, MAX_PHASE)
+			if idx > phaseReached then
+				phaseReached = idx
+				if phaseReached >= 1 then
+					R_ChargeCtrl:FireServer({ act = "phase", idx = phaseReached })
+					-- เต็มเฟส: เล่นเสียง + VFX (ลอง phaseX ก่อน) ฝั่งเรา แล้ว broadcast ทั้ง "phaseX" และ "phase"
+					playLocalSfxFromTool("charge_full"); echoSfxToOthers("charge_full", 100)
+					playChargeVfxStep("phase", phaseReached)
+					vfxBroadcast(("phase%d"):format(phaseReached))
+					vfxBroadcast("phase")
+				end
+			end
+			task.wait(0.02)
+		end
+	end)
+end
+
+----------------------------------------------------------------
+-- Lifecycle / Cleanup
+----------------------------------------------------------------
+local function cleanup()
+	pressed  = false
+	if charging then charging = false; R_ChargeCtrl:FireServer({ act = "cancel" }) end
+	stopChargeLoop()
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	table.clear(conns)
+end
+
+----------------------------------------------------------------
+-- Input
+----------------------------------------------------------------
+local function onActivated()
+	if pressed then return end
+	local char = ctx.getCharacter()
+	hum = char and char:FindFirstChildOfClass("Humanoid") or nil
+	if not hum then return end
+
+	refreshChargeConfig()
+
+	pressed   = true
+	charging  = false
+	tPressed  = tick()
+	tCharge0  = 0        -- จะตั้งจริงตอนเข้าสถานะชาร์จ
+	pressToken += 1
+	local myToken = pressToken
+
+	-- รอให้เกิน MIN_CHARGE_SEC ก่อนเข้าโหมดชาร์จจริง
+	task.delay(MIN_CHARGE_SEC, function()
+		if not pressed or myToken ~= pressToken then return end
+		charging = true
+		tCharge0 = tick()                                    -- ✅ ตั้งฐานเวลา "เริ่มชาร์จจริง" ที่นี่
+		R_ChargeCtrl:FireServer({
+			act = "start",
+			t   = tCharge0,          -- เผื่อฝั่งเซิร์ฟอยากใช้เวลา client
+			phaseSec = PHASE_SEC,
+			max = MAX_PHASE,
+		})
+		beginChargeLoop()
+	end)
+end
+
+local function onDeactivated()
+	if not pressed then return end
+	pressed = false
+	pressToken += 1
+
+	if charging then
+		-- ✅ ใช้ tCharge0 เป็นฐานเดียวกับเซิร์ฟ
+		local base = (tCharge0 > 0) and tCharge0 or tPressed
+		local held = math.max(0, tick() - base)
+		local calcPhase = math.clamp(math.floor((held + EPS_PHASE) / PHASE_SEC), 0, MAX_PHASE)
+		local phaseAtRelease = math.max(phaseReached, calcPhase)
+
+		charging = false
+		stopChargeLoop()
+
+		if phaseAtRelease >= 1 then
+			R_ChargeCtrl:FireServer({ act = "phase", idx = phaseAtRelease, source = "release_align" })
+		end
+
+		R_ChargeCtrl:FireServer({
+			act   = "release",
+			held  = held,
+			phase = phaseAtRelease,
+			map   = { CATK_IDS[1], CATK_IDS[2], CATK_IDS[3] },
+			t     = tick(),
+		})
+	else
+		-- คลิกสั้น: โจมตีปกติ
+	end
+end
+
+----------------------------------------------------------------
+-- Failsafes
+----------------------------------------------------------------
+local function bindFailsafes(tool: Tool)
+	table.insert(conns, UIS.InputEnded:Connect(function(input, gp)
+		if gp then return end
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			if pressed then onDeactivated() end
+		end
+	end))
+
+	table.insert(conns, tool.AncestryChanged:Connect(function()
+		if not tool:IsDescendantOf(game) then
+			if charging then R_ChargeCtrl:FireServer({ act = "cancel" }) end
+			cleanup()
+		end
+	end))
+
+	local ch = ctx.getCharacter()
+	local h = ch and ch:FindFirstChildOfClass("Humanoid") or nil
+	if h then
+		table.insert(conns, h.Died:Connect(function()
+			if charging then R_ChargeCtrl:FireServer({ act = "cancel" }) end
+			cleanup()
+		end))
+	end
+
+	table.insert(conns, RunService.Heartbeat:Connect(function()
+		if charging and not pressed then
+			stopChargeLoop()
+			charging = false
+		end
+	end))
+end
+
+----------------------------------------------------------------
+-- Tool lifecycle
+----------------------------------------------------------------
+ctx.onToolChanged(function(oldTool, newTool)
+	if oldTool then cleanup() end
+	currentTool = newTool
+	if newTool then
+		newTool.Equipped:Once(function()
+			local char = ctx.getCharacter()
+			hum = char and char:FindFirstChildOfClass("Humanoid") or nil
+			if not hum then return end
+			animator = ensureAnimator(hum)
+			refreshChargeConfig()
+			table.insert(conns, newTool.Activated:Connect(onActivated))
+			table.insert(conns, newTool.Deactivated:Connect(onDeactivated))
+			bindFailsafes(newTool)
+		end)
+	end
+end)
+
+----------------------------------------------------------------
+-- Remotes
+----------------------------------------------------------------
+R_ForceCast.OnClientEvent:Connect(function(p)
+	if type(p) ~= "table" then return end
+	local moveId = tostring(p.moveId or "")
+	if moveId == "" then return end
+	-- ⛔ ปล่อยให้ CharacterAttackAnimator เป็นคนเล่น catk1/2/3 เท่านั้น
+	if isCatk(moveId) then return end
+	cast(moveId)
+end)
+
+-- ✅ ฟังเสียง echo จากท่อใหม่
+RemSfx.OnClientEvent:Connect(function(p)
+	if type(p) ~= "table" then return end
+	local who = p.who
+	local name = tostring(p.name or "")
+	local path = tostring(p.path or "Animations/R15/charge/sfx")
+	local range = tonumber(p.range or 80) or 80
+	if who == plr or name == "" then return end
+
+	local char = who and who.Character or nil
+	if not char then return end
+	local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?; if not root then return end
+
+	local tool = char:FindFirstChildOfClass("Tool")
+	local node: Instance? = tool
+	for seg in string.gmatch(path, "[^/]+") do
+		node = node and node:FindFirstChild(seg)
+	end
+	local snd = node and node:FindFirstChild(name)
+	if snd and snd:IsA("Sound") then
+		local s = snd:Clone()
+		s.RollOffMaxDistance = math.max(range, 10)
+		s.Looped = false
+		s.Parent = root
+		s:Play()
+		Debris:AddItem(s, math.max(0.6, s.TimeLength + 0.25))
+	end
+end)
+
+plr.CharacterAdded:Connect(function() cleanup() end)
+plr.CharacterRemoving:Connect(function() cleanup() end)

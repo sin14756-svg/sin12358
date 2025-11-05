@@ -1,0 +1,500 @@
+--!strict
+-- ReplicatedStorage/Shared/FX/FXBus  (fixed: resource/work onhit SFX)
+local Players = game:GetService("Players")
+local RS      = game:GetService("ReplicatedStorage")
+local LP      = Players.LocalPlayer
+local Http    = game:GetService("HttpService")
+
+local SfxRouter = require(RS.Shared.SFX.SfxRouter)
+local VfxRunner = require(RS.Shared.VFX.VfxRunner)
+local VfxCore   = require(RS.Shared.VFX.VfxCore)
+-- ===== ORE moves ที่เป็น SFX-only (ไม่เรียก VfxRunner) =====
+local ORE_ONLY: {[string]: boolean} = {
+	ore_shot = true, ore_heal = true, ore_guard = true, ore_trick = true,
+}
+local function isOreMove(id: any): boolean
+	return ORE_ONLY[string.lower(tostring(id or ""))] == true
+end
+
+-- ===== จำ kind ของ resource_break ต่อพิกัด เพื่ออุด onhit ที่ไม่พก type =====
+local RB_LAST_KIND: {[string]: string} = {}
+local function posKeyFromAny(v: any): string
+	local p = v
+	if typeof(v) ~= "Vector3" then
+		p = (v and v.pos) or (v and v.qpos) or nil
+	end
+	if typeof(p) ~= "Vector3" then return "" end
+	return string.format("%d,%d,%d", math.floor(p.X + 0.5), math.floor(p.Y + 0.5), math.floor(p.Z + 0.5))
+end
+
+local function rememberRBKind(pkt: any)
+	local kind = tostring((pkt and (pkt.resourceType or pkt.type or pkt.kind)) or "")
+	if kind == "" then return end
+	local key = posKeyFromAny(pkt)
+	if key ~= "" then
+		RB_LAST_KIND[key] = string.lower(kind)
+	end
+end
+
+local function resolveRBKind(pkt: any): string?
+	local kind = tostring((pkt and (pkt.resourceType or pkt.type or pkt.kind)) or "")
+	if kind ~= "" then return string.lower(kind) end
+	local key = posKeyFromAny(pkt)
+	if key ~= "" then
+		return RB_LAST_KIND[key]
+	end
+	return nil
+end
+
+
+local Shared = RS:FindFirstChild("Shared") or Instance.new("Folder", RS); Shared.Name = "Shared"
+local FX     = Shared:FindFirstChild("FX") or Instance.new("Folder", Shared); FX.Name = "FX"
+local Remote = FX:FindFirstChild("FXBusRemote") :: RemoteEvent?
+if not Remote then Remote = Instance.new("RemoteEvent"); Remote.Name = "FXBusRemote"; Remote.Parent = FX end
+
+local DEBUG = true
+local function J(x:any) local ok,s=pcall(function() return Http:JSONEncode(x) end); return ok and s or tostring(x) end
+local function log(tag:string, ...) if DEBUG then print(("[FXBus][%s] %s"):format(tag, table.concat(table.create(select("#", ...), ...)," | "))) end end
+
+-- REPLACE: CFG.ONHIT_STEPS_COMBAT
+local CFG = {
+	-- ...
+	ONHIT_STEPS_COMBAT   = { "hit_on", "hit1_on", "onhit", "hit" },
+	ONHIT_STEPS_RESOURCE = { "onhit_resource", "onhit", "hit_on", "hit1_on", "hit" },
+}
+
+-- ===== Catalog bridge switches =====
+local CATALOG_ONLY: boolean = (RS:GetAttribute("Fx_CatalogOnly") ~= false)      -- default: true
+local CATALOG_SFX_FROM_BOOT: boolean = (RS:GetAttribute("Fx_CatalogSfxByBoot") == true) -- default: false → เราจะเล่น SFX เอง
+
+local RESOURCE_MOVES = {
+	ore_heal = true, ore_guard = true, ore_trick = true, ore_shot = true,
+	resource_break = true,
+}
+
+-- ===== minimal melee alias fallback (for VfxRunner fail) =====
+local VFX_ALIAS = {}
+
+local function isResourceMove(mv:any): boolean
+	mv = tostring(mv or "")
+	return RESOURCE_MOVES[mv] == true
+end
+
+local function isResourcePayload(p:any): boolean
+	if type(p) ~= "table" then return false end
+	local tk = tostring(p.targetKind or "")
+	return (tk == "resource" or tk == "work")
+end
+
+local function ensureVec3(v:any): Vector3?
+	if typeof(v) == "Vector3" then return v end
+	if type(v) == "table" and typeof(v.x)=="number" and typeof(v.y)=="number" and typeof(v.z)=="number" then
+		return Vector3.new(v.x, v.y, v.z)
+	end
+	return nil
+end
+
+-- แทนที่ของเดิมทั้งบล็อก
+-- REPLACE: success(worked, ret)
+local function success(worked: boolean, ret: any): boolean
+	if not worked then return false end
+	if ret == true then return true end
+	if typeof(ret) == "number" then return ret > 0 end
+	if typeof(ret) == "table" then
+		local ok = rawget(ret, "ok");    if ok ~= nil then return ok == true end
+		local n  = rawget(ret, "count"); if typeof(n) == "number" then return n > 0 end
+	end
+	-- เดิม: nil ถูกนับว่าผ่าน → ทำให้หยุดก่อนถึง hit_on
+	return false
+end
+
+
+-- ghost tool จากชื่อคาตาล็อก (ใช้เฉพาะฝั่งคนรอบ ๆ)
+local function makeGhostTool(catalogName: string?): Tool?
+	if type(catalogName) ~= "string" or catalogName == "" then return nil end
+	local t = Instance.new("Tool")
+	t.Name = "_GhostTool_"..catalogName
+	t:SetAttribute("VfxCatalog", catalogName)
+	return t
+end
+
+local function chooseOnhitSteps(opts:any?): {string}
+	if type(opts)=="table" and (opts.targetKind=="resource" or opts.targetKind=="work") then
+		return CFG.ONHIT_STEPS_RESOURCE
+	end
+	return CFG.ONHIT_STEPS_COMBAT
+end
+
+
+-- ==== MELEE support (client echo from server) ====
+
+-- ดึงผู้ตีจาก payload (ชื่อ "Player1(-1)" / userId / source → Character)
+local function _playerByNameLike(s: string?): Player?
+	if type(s) ~= "string" or s == "" then return nil end
+	local nameOnly = s:match("^([^%(]+)%(") or s
+	for _,plr in ipairs(Players:GetPlayers()) do
+		if string.lower(plr.Name) == string.lower(nameOnly) then return plr end
+	end
+	return nil
+end
+
+local function _characterOf(instance: Instance?): Model?
+	if not instance then return nil end
+	if instance:IsA("Model") and instance:FindFirstChild("Humanoid") then return instance end
+	local mdl = instance:FindFirstAncestorOfClass("Model")
+	if mdl and mdl:FindFirstChild("Humanoid") then return mdl end
+	return nil
+end
+
+local function _resolveCasterPlayer(payload: {[string]: any}): (Player?, Model?)
+	local plr: Player? = nil
+	if typeof(payload.fromUserId) == "number" then
+		plr = Players:GetPlayerByUserId(payload.fromUserId)
+	end
+	if not plr then
+		plr = _playerByNameLike(payload.fromName or payload.senderName or tostring(payload.from or ""))
+	end
+	if not plr then
+		local ch = _characterOf(payload.source)
+		if ch then plr = Players:GetPlayerFromCharacter(ch) end
+	end
+	local ch = plr and plr.Character or (_characterOf(payload.source) or _characterOf(payload.target))
+	return plr, ch
+end
+
+local function _partByNames(m: Model?, names: {string}): BasePart?
+	if not m then return nil end
+	for _,n in ipairs(names) do
+		local p = m:FindFirstChild(n)
+		if p and p:IsA("BasePart") then return p end
+	end
+	return nil
+end
+
+local function _anchorForMelee(payload: {[string]: any}): CFrame
+	local _, ch = _resolveCasterPlayer(payload)
+	if ch then
+		local hand = _partByNames(ch, {"RightHand","HandRight","Right Arm","LeftHand","HandLeft","Left Arm"})
+		if hand then return hand.CFrame end
+		local hrp = _partByNames(ch, {"HumanoidRootPart","UpperTorso","Torso"})
+		if hrp then return hrp.CFrame end
+	end
+	local pos = (typeof(payload.pos)=="Vector3" and payload.pos) or Vector3.new()
+	return CFrame.new(pos)
+end
+
+local _recentMelee = {} :: {[string]: number}
+local function _meleeKey(payload: {[string]: any}, casterKey: string, mv: string, step: string): string
+	local idx = tostring(payload.idx or payload.index or "?")
+	return table.concat({"MELEE", casterKey, mv, step, idx}, "|")
+end
+local function _dedupeMelee(payload: {[string]: any}, casterKey: string, mv: string, step: string, windowSec: number?): boolean
+	local k = _meleeKey(payload, casterKey, mv, step)
+	local now = os.clock()
+	local last = _recentMelee[k] or 0
+	_recentMelee[k] = now
+	return (now - last) <= (windowSec or 0.10)
+end
+
+local function _handleMeleeRX(payload: {[string]: any})
+	local mv   = tostring(payload.move or payload.moveId or "atk1")
+	local step = tostring(payload.step or "hit_on")
+	local cat  = tostring(payload.vfxcatalog or payload.catalog or "")
+
+	local plr, ch = _resolveCasterPlayer(payload)
+	local casterKey = plr and ("u"..plr.UserId)
+		or (ch and ("c:"..tostring(ch:GetAttribute("EntityId") or ch:GetAttribute("Uid") or ch:GetFullName())))
+		or tostring(payload.from or payload.fromName or "?")
+
+	if _dedupeMelee(payload, casterKey, mv, step, 0.10) then return end
+
+	local cf = _anchorForMelee(payload)
+	-- ใช้ “ghost tool” ถ้ามีชื่อ catalog (ช่วยให้ Registry เลือก slash1 ถูก)
+	local tool: Tool? = nil
+	if type(cat)=="string" and cat ~= "" then
+		tool = makeGhostTool(cat) -- เรามี makeGhostTool อยู่แล้วด้านบน
+	end
+
+	local worked, ret = pcall(function()
+		return VfxRunner.play(tool, mv, step, {
+			pos = cf.Position, hitPos = cf.Position,
+			catalog = (cat ~= "" and cat or nil), via = "bus-melee"
+		})
+	end)
+	if not success(worked, ret) then
+		-- ไม่มีอะไรเกิด → อย่าปล่อยเงียบ ให้ลองคีย์ alias ถ้ามี
+		local key = (VFX_ALIAS and VFX_ALIAS[mv] and VFX_ALIAS[mv][step]) or nil
+		if key then pcall(function() VfxCore.Play(key, cf, { lifetime = 0.25 }) end) end
+	end
+	if DEBUG then print("[FXBus][RX.melee]", mv, step, cat) end
+end
+
+-- ===== SFX helper (ใหม่) =====
+-- ===== SFX helper (PATCH: resource SFX = catalog-first) =====
+-- ===== SFX helper (catalog-first สำหรับรีซอส, Router สำหรับคอมแบต) =====
+local function playOnhitSfx(pos: Vector3?, tool: Tool?, moveId: string, asEcho: boolean, payload: any?)
+	if not CFG.ONHIT_SOUND then return end
+
+	-- จุดปล่อยเสียง
+	local cf: CFrame
+	do
+		if pos then
+			cf = CFrame.new(pos)
+		else
+			local char = Players.LocalPlayer and Players.LocalPlayer.Character or nil
+			local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+			cf = (hrp and hrp.CFrame) or CFrame.new()
+		end
+	end
+
+	-- 1) รีซอส (ore_*, resource_break) → ใช้คาตาล็อกเสียงก่อน
+	if isResourceMove(moveId) then
+		local okCat, Cat = pcall(function()
+			return require(RS.Shared.SFX.Catalog.resourcesfx.resourcesfx)
+		end)
+		if okCat and type(Cat)=="table" and typeof(Cat.Get)=="function" then
+			local name = Cat.Get(moveId, "onhit", payload)
+			if type(name)=="string" and name~="" then
+				-- หา Sound จาก Assets/SFX ก่อน แล้วค่อย Shared/SFX
+				local roots = (typeof(Cat.AssetRoots)=="function" and Cat.AssetRoots()) or { "Assets/SFX", "Shared/SFX" }
+				local function resolve(path: string): Instance?
+					local node: Instance = RS
+					for seg in string.gmatch(path, "[^/]+") do
+						node = node:FindFirstChild(seg)
+						if not node then return nil end
+					end
+					return node
+				end
+				for _,rootPath in ipairs(roots) do
+					local root = resolve(rootPath)
+					local snd  = root and root:FindFirstChild(name)
+					if snd and snd:IsA("Sound") then
+						local p = Instance.new("Part")
+						p.Anchored,p.CanCollide,p.CanTouch,p.CanQuery = true,false,false,false
+						p.Size, p.Transparency, p.CFrame = Vector3.new(0.1,0.1,0.1), 1, cf
+						p.Parent = workspace
+						local c = (snd :: Sound):Clone(); c.Parent = p; c:Play()
+						local t = (c.TimeLength and c.TimeLength>0) and c.TimeLength or 2
+						game.Debris:AddItem(c, t+1); game.Debris:AddItem(p, t+1)
+						if DEBUG then print("[FXBUSBOOT] ✓CAT.SFX", name, "move=",moveId) end
+						return
+					end
+				end
+			end
+		end
+		-- ถ้าคาตาล็อกหา asset ไม่เจอ → ตกไป Router ต่อ
+	end
+
+	-- 2) คอมแบตทั่วไป หรือรีซอสที่คาตาล็อกไม่เจอ → Router เดิม
+	local char = Players.LocalPlayer and Players.LocalPlayer.Character or nil
+	local hum  = char and char:FindFirstChildOfClass("Humanoid") or nil
+	local sctx = { tool=tool, moveId=moveId, character=char, humanoid=hum, clipSpeed=1, atkSpeed=1, asEcho=asEcho, pos=pos }
+	pcall(function() SfxRouter.PlayOnHit(sctx, cf) end)
+end
+
+
+-- ===== local plays =====
+local function localPlay_marker(tool: Tool?, moveId: string, step: string, ctx: any?)
+	if CATALOG_ONLY and (isResourceMove(moveId) or isResourcePayload(ctx)) then
+		log("BYPASS.marker", "move="..moveId, "step="..step)
+		return
+	end
+	log("LCL.marker", "move="..moveId, "step="..step, "ctx="..J(ctx or {}))
+	pcall(function() VfxRunner.play(tool, moveId, step, ctx) end)
+end
+
+-- ===== local plays =====
+-- REPLACE-ALL: localPlay_onhit(tool, moveId, pos, opts)
+local function localPlay_onhit(tool: Tool?, moveId: string?, pos: Vector3?, opts: any?, forceStep: string?)
+	if not pos then
+		if (isResourceMove(moveId) or isResourcePayload(opts)) and not CATALOG_SFX_FROM_BOOT then
+			playOnhitSfx(nil, tool, tostring(moveId or "atk1"), false, opts)
+		end
+		return
+	end
+
+	local useMove = (moveId and moveId ~= "" and moveId) or "atk1"
+
+	-- SFX (เหมือนเดิม) ...
+	if isOreMove(useMove) then
+		playOnhitSfx(pos, tool, useMove, false, opts)
+	elseif string.lower(useMove) == "resource_break" then
+		playOnhitSfx(pos, tool, "resource_break", false, opts)
+	end
+
+	local steps = forceStep and { forceStep } or chooseOnhitSteps(opts)
+	local ctx = { pos = pos, hitPos = pos, targetKind = opts and opts.targetKind }
+
+	local ok = false
+	for _, step in ipairs(steps) do
+		local worked, ret = pcall(function()
+			return VfxRunner.play(tool, useMove, step, ctx)
+		end)
+		if success(worked, ret) then ok = true; break end
+	end
+
+	if not ok then
+		if (not isResourceMove(useMove)) and (not isResourcePayload(opts)) then
+			pcall(function() VfxCore.Play("icecage", CFrame.new(pos), { lifetime = 0.25 }) end)
+		end
+	end
+
+	if CFG.ONHIT_SOUND and not isOreMove(useMove) then
+		playOnhitSfx(pos, tool, useMove, false, opts)
+	end
+end
+
+-- ===== public API =====
+local M = {}
+
+function M.emitMarker(tool: Tool, moveId: string, step: string, opts: {range: number?, pos: Vector3?}? )
+	localPlay_marker(tool, moveId, step, opts)
+	if not (CFG.ECHO_ENABLED and Remote) then return end
+	local vfxcat = (tool and (tool:GetAttribute("VfxCatalog") or tool:GetAttribute("vfxcatalog") or tool:GetAttribute("VfxConfig") or tool:GetAttribute("vfxconfig"))) :: any
+	local payload = {
+		kind="marker", moveId=moveId, step=step,
+		range=(opts and opts.range) or CFG.DEFAULT_RANGE, pos=opts and opts.pos,
+		attackerId = LP and LP.UserId or nil,
+		toolName   = tool and tool.Name or nil,
+		vfxcatalog = (type(vfxcat)=="string" and vfxcat) or nil,
+		targetKind = opts and opts.targetKind,
+	}
+	log("TX.marker", J(payload))
+	pcall(function() Remote:FireServer(payload) end)
+end
+
+function M.emitOnHit(tool: Tool?, moveId: string?, pos: Vector3, opts: {idx: number?, range: number?, targetKind: string?, targetId: any?}? )
+	local useMove = (moveId and moveId ~= "" and moveId) or "atk1"
+	localPlay_onhit(tool, useMove, pos, opts)
+	if not (CFG.ECHO_ENABLED and Remote) then return end
+	local vfxcat = (tool and (tool:GetAttribute("VfxCatalog") or tool:GetAttribute("vfxcatalog") or tool:GetAttribute("VfxConfig") or tool:GetAttribute("vfxconfig"))) :: any
+	local payload = {
+		kind="onhit", moveId=useMove, idx=opts and opts.idx, pos=pos,
+		range=(opts and opts.range) or CFG.DEFAULT_RANGE,
+		targetKind=opts and opts.targetKind, targetId=opts and opts.targetId,
+		attackerId = LP and LP.UserId or nil,
+		toolName   = tool and tool.Name or nil,
+		vfxcatalog = (type(vfxcat)=="string" and vfxcat) or nil,
+	}
+	log("TX.onhit", J(payload))
+	pcall(function() Remote:FireServer(payload) end)
+end
+
+-- ===== listener จากเซิร์ฟเวอร์ =====
+-- ReplicatedStorage/Shared/FX/FXBus.lua
+-- REPLACE-ALL: receive(payload)  (no ellipses, drop-in)
+
+-- safe receive() — kind switch แบบ if/elseif/end ชัดเจน
+local function receive(payload: any)
+	if type(payload) ~= "table" then return end
+
+	local Players = game:GetService("Players")
+	local kind = tostring(payload.kind or "")
+	log("RX", "kind="..kind, J(payload))
+	
+	if kind == "melee" then
+		_handleMeleeRX(payload)
+		return
+
+	-- ===== MARKER =====
+	elseif kind == "marker" then
+		local moveId = tostring(payload.moveId or "")
+		local step   = tostring(payload.step or "")
+		local pos    = ensureVec3(payload.pos)
+		local ctx    = pos and { pos = pos, targetKind = payload.targetKind }
+			or { targetKind = payload.targetKind }
+
+		-- โหมดคาตาล็อกล้วน (resource/work) → ข้าม marker
+		if CATALOG_ONLY and (
+			(isResourceMove and isResourceMove(moveId)) or
+				(isResourcePayload and isResourcePayload(payload))
+			) then
+			log("BYPASS.rx.marker", "move="..moveId, "step="..step)
+			return
+		end
+
+		-- หา tool (จริง/ghost)
+		local tool: Tool? = nil
+		if typeof(payload.attackerId) == "number" then
+			local plr = Players:GetPlayerByUserId(payload.attackerId)
+			local ch  = plr and plr.Character
+			local t   = ch and ch:FindFirstChildOfClass("Tool")
+			if t and t:IsA("Tool") then tool = t end
+		end
+		if not tool and type(payload.vfxcatalog) == "string" then
+			tool = makeGhostTool(payload.vfxcatalog)
+		end
+
+		localPlay_marker(tool, moveId, step, ctx)
+		return
+
+			-- ===== ONHIT (รวมกรณี moveId="resource_break") =====
+	elseif kind == "onhit" then
+		local pos    = ensureVec3(payload.pos)
+		local moveId = tostring(payload.moveId or "atk1")
+		if not pos then return end
+
+		-- SFX ก่อน (ไม่ return เพื่อให้ VFX ทำงานต่อ)
+		local isResMoveFn = isResourceMove or isOreMove
+		if type(isResMoveFn) == "function" and isResMoveFn(moveId) then
+			log("PATCH.rx.onhit", "ore/resource SFX then allow VFX", moveId)
+			if not CATALOG_SFX_FROM_BOOT then
+				playOnhitSfx(pos, nil, moveId, true, payload)
+			end
+		elseif string.lower(moveId) == "resource_break" then
+			log("PATCH.rx.onhit", "resource_break SFX then allow VFX")
+			local kindGuess = resolveRBKind(payload)
+			if not CATALOG_SFX_FROM_BOOT then
+				playOnhitSfx(pos, nil, "resource_break", true, { type = kindGuess, tier = payload.tier })
+			end
+		end
+
+		-- หา tool (จริง/ghost) เพื่อส่งเข้าท่อ VFX
+		local tool: Tool? = nil
+		if typeof(payload.attackerId) == "number" then
+			local plr = Players:GetPlayerByUserId(payload.attackerId)
+			local ch  = plr and plr.Character
+			local t   = ch and ch:FindFirstChildOfClass("Tool")
+			if t and t:IsA("Tool") then tool = t end
+		end
+		if not tool and type(payload.vfxcatalog) == "string" then
+			tool = makeGhostTool(payload.vfxcatalog)
+		end
+
+		-- รับ forceStep จาก payload ถ้ามี (แก้ ~ เป็น ~=)
+		local forceStep = (type(payload.step) == "string" and payload.step ~= "") and payload.step or nil
+		localPlay_onhit(tool, moveId, pos, payload, forceStep)
+		return
+
+			-- ===== RESOURCE_BREAK (บอร์ดแคสต์แบบ KIND โดยเซิร์ฟเวอร์) =====
+	elseif kind == "resource_break" then
+		rememberRBKind(payload)
+
+		if CATALOG_ONLY then
+			log("BYPASS.rx.resource_break")
+			return
+		end
+
+		local pos = ensureVec3(payload.pos)
+		if not pos then return end
+
+		local vfx = payload.vfx
+			or (payload.type == "tree" and "resource_break_tree")
+			or (payload.type == "rock" and "resource_break_rock")
+			or "resource_break"
+
+		pcall(function()
+			VfxCore.Play(vfx, CFrame.new(pos), { lifetime = 2 })
+		end)
+		return
+
+			-- ===== UNKNOWN =====
+	else
+		log("RX.unknown", kind)
+		return
+	end
+end
+
+
+if Remote then Remote.OnClientEvent:Connect(receive) end
+return M

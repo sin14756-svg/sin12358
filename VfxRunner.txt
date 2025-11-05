@@ -1,0 +1,1261 @@
+--!strict
+-- ReplicatedStorage/Shared/VFX/VfxRunner.lua
+-- Play VFX from tool registry; with fallback to Shared/Skills/<Skill>/VFX/vfxconfig
+-- ✅ DEBUG หนัก + รองรับ ParticleEmitter Attributes:
+--    - EmitCount (number) : จำนวนอนุภาคที่จะสั่ง :Emit() แบบ burst
+--    - EmitDelay (number) : ดีเลย์หลังสปอนก่อนค่อย Emit (ต่อ emitter)
+--    ไม่มี EmitCount/EmitDelay -> พฤติกรรมเดิม (BurstCount / continuous)
+-- ✅ Bridge: ถ้าเรียก step = "trail_on"/"trail_off" แล้วใน config ไม่มี
+--    จะ "ดึงเฉพาะ action ประเภท trail" จาก start/end มาให้โดยอัตโนมัติ
+
+local RunS = game:GetService("RunService")
+local RS   = game:GetService("ReplicatedStorage")
+
+local VfxRegistry = require(RS.Shared.VFX.VfxRegistry)
+local Lib         = require(RS.Shared.VFX.VfxLib)
+
+type Keyframe  = { [number]: number }
+type Keyframes = { Keyframe }
+
+local Runner = {}
+
+-- ================= DEBUG ======================
+local DEBUG = true -- เปิด/ปิด log ที่ runtime ได้ด้วย Runner.setDebug(true/false)
+
+local function now(): number return time() end
+local function short(inst: Instance?): string
+	if not inst then return "nil" end
+	local p = {}
+	local cur: Instance? = inst
+	for _=1,6 do
+		if not cur then break end
+		table.insert(p, 1, cur.Name)
+		cur = cur.Parent
+	end
+	return table.concat(p, "/")
+end
+
+local function dbg(fmt: string, ...)
+	if not DEBUG then return end
+	local ok, txt = pcall(string.format, fmt, ...)
+	if ok then print(("🟦[VFX] %.2f  %s"):format(now()%10000, txt)) end
+end
+
+function Runner.setDebug(v: boolean) DEBUG = v and true or false end
+
+-- ================= pool (per assetsRoot + asset) =================
+local pool: { [string]: { items: { Instance }, make: () -> Instance? } } = {}
+
+local function poolKey(root: Instance?, name: string) return tostring(root).."::"..name end
+
+local function take(root: Instance?, name: string): Instance?
+	local key = poolKey(root, name)
+	local p = pool[key]
+	if p and #p.items > 0 then
+		local inst = p.items[#p.items]
+		p.items[#p.items] = nil
+		if inst then inst.Parent = nil end
+		dbg("POOL TAKE  %s  (%d left)", key, #(p.items))
+		return inst
+	end
+	if not p then
+		pool[key] = {
+			items = {},
+			make  = function()
+				if not root then return nil end
+				local c = Lib.CloneAsset(root, name)
+				dbg("POOL MAKE  %s/%s  -> %s", short(root), tostring(name), short(c))
+				return c
+			end
+		}
+		p = pool[key]
+	end
+	return p.make()
+end
+
+local function give(root: Instance?, name: string, inst: Instance?)
+	if not inst then return end
+	inst.Parent = nil
+	pcall(function()
+		for _,d in ipairs(inst:GetDescendants()) do
+			if d:IsA("ParticleEmitter") then d.Enabled = false; pcall(function() d:Clear() end)
+			elseif d:IsA("Trail") then d.Enabled = false end
+		end
+	end)
+	local key = poolKey(root, name)
+	pool[key] = pool[key] or {
+		items = {},
+		make  = function() if not root then return nil end; return Lib.CloneAsset(root, name) end
+	}
+	table.insert(pool[key].items, inst)
+	dbg("POOL GIVE  %s  (now %d)", key, #(pool[key].items))
+end
+
+function Runner.clearPools()
+	for _, p in pairs(pool) do p.items = {} end
+	pool = {}
+	dbg("POOL CLEARED")
+end
+
+-- ================= timeline =================
+local function eval(frames: Keyframes?, t: number): number?
+	if not frames or #frames == 0 then return nil end
+	if t <= frames[1][1] then return frames[1][2] end
+	for i = 2, #frames do
+		local t1, v1 = frames[i][1],   frames[i][2]
+		local t0, v0 = frames[i-1][1], frames[i-1][2]
+		if t <= t1 then
+			local a = (t - t0) / math.max(1e-6, (t1 - t0))
+			return v0 + (v1 - v0) * a
+		end
+	end
+	return frames[#frames][2]
+end
+
+-- ================= running =================
+type Timer = { at: number, fn: ()->(), note: string? }
+type Effect = {
+	inst: Instance, asset: string, assetsRoot: Instance?,
+	t0: number, dur: number, tag: string?,
+	update: (dt: number)->(), finish: (()->())?,
+	timers: {Timer}?
+}
+local running: {Effect} = {}
+local tagged : {[string]: {Effect}} = {}
+local steppedConn: RBXScriptConnection?
+
+-- 🔹 Global pending timers (สำหรับ multi/bulk scheduling)
+local pendingTimers: {Timer} = {}
+local function schedule(at: number, fn: ()->(), note: string?)
+	table.insert(pendingTimers, { at = at, fn = fn, note = note })
+	-- ให้ลูปตื่นทำงานแน่ ๆ
+	if not steppedConn then
+		-- ensureLoop ด้านล่างจะ set steppedConn
+	end
+end
+
+-- ใช้สัญญาณที่วิ่งได้ทั้ง Client/Server
+local updateSignal = RunS.Heartbeat
+
+local function ensureLoop()
+	if steppedConn then return end
+	steppedConn = updateSignal:Connect(function(dt)
+		local tnow = now()
+
+		-- 🔸 Dispatch GLOBAL pending timers ก่อน
+		if #pendingTimers > 0 then
+			for j = #pendingTimers, 1, -1 do
+				local tm = pendingTimers[j]
+				if tnow >= tm.at then
+					dbg("TIMER FIRE (GLOBAL)  %s", tm.note or "")
+					pcall(tm.fn)
+					table.remove(pendingTimers, j)
+				end
+			end
+		end
+
+		-- 🔸 Dispatch timers ภายใน effect แต่ละตัว + อัปเดตรันนิ่งเอฟเฟกต์
+		for i = #running, 1, -1 do
+			local e = running[i]
+
+			-- dispatch timers ของ effect
+			if e.timers and #e.timers > 0 then
+				for j = #e.timers, 1, -1 do
+					local tm = e.timers[j]
+					if tnow >= tm.at then
+						dbg("TIMER FIRE  asset=%s  note=%s", e.asset, tm.note or "")
+						pcall(tm.fn)
+						table.remove(e.timers, j)
+					end
+				end
+			end
+
+			local t = tnow - e.t0
+			if t >= e.dur then
+				if e.finish then pcall(e.finish) end
+				give(e.assetsRoot, e.asset, e.inst)
+				table.remove(running, i)
+				dbg("EFFECT END  asset=%s  tag=%s", e.asset, tostring(e.tag))
+			else
+				pcall(e.update, dt)
+			end
+		end
+
+		-- 🔸 ปิดลูปเมื่อไม่มีทั้ง running และ pendingTimers
+		if #running == 0 and #pendingTimers == 0 and steppedConn then
+			steppedConn:Disconnect()
+			steppedConn = nil
+		end
+	end)
+end
+
+local function addEffect(e: Effect)
+	table.insert(running, e)
+	if e.tag then
+		tagged[e.tag] = tagged[e.tag] or {}
+		table.insert(tagged[e.tag], e)
+	end
+	dbg("EFFECT ADD  asset=%s  dur=%.2f  tag=%s", e.asset, e.dur, tostring(e.tag))
+	ensureLoop()
+end
+
+local function stopByTag(tag: string)
+	local lst = tagged[tag]; if not lst then return end
+	for _, e in ipairs(lst) do e.dur = 0 end
+	tagged[tag] = nil
+	dbg("STOP BY TAG  %s", tag)
+end
+
+-- ✅ กันสปอนซ้ำด้วย tag (เช่น "windup")
+local function tagAlive(tag: string?): boolean
+	if not tag then return false end
+	local lst = tagged[tag]; if not lst then return false end
+	for _, e in ipairs(lst) do
+		if (now() - e.t0) < e.dur then return true end
+	end
+	return false
+end
+
+-- ================= helpers =================
+local function toCFrameOf(part: BasePart?, off: CFrame?): CFrame
+	return (part and (part.CFrame * (off or CFrame.new()))) or CFrame.new()
+end
+
+-- ===== merge helper: เติม trail จาก fallback ถ้า base ไม่มี =====
+local function hasActType(list, typ)
+	if type(list) ~= "table" then return false end
+	for _,a in ipairs(list) do
+		if type(a)=="table" and a.type==typ then return true end
+	end
+	return false
+end
+
+local function mergeTrailActsIfMissing(base, extra)
+	if type(base)~="table" or type(extra)~="table" then return base end
+	if hasActType(base,"trail_on") or hasActType(base,"trail_off") then return base end
+	local merged = table.create(#base)
+	for i=1,#base do merged[i] = base[i] end
+	for _,a in ipairs(extra) do
+		if type(a)=="table" and (a.type=="trail_on" or a.type=="trail_off") then
+			table.insert(merged, a)
+		end
+	end
+	return merged
+end
+
+-- snap-to-ground + yaw control
+-- แทนที่ฟังก์ชันเดิมทั้งหมด
+-- snap-to-ground + yaw control (nil-safe)
+local function snapToGroundBasis(baseCF: CFrame, character: Model?, act: {[string]: any}?): CFrame
+	local castFromY  = (act and tonumber(act.groundCastFromY)) or 4
+	local rayLen     = (act and tonumber(act.groundCastLen))   or 30
+	local yoff       = (act and tonumber(act.groundOffset))    or 0.05
+	local mode       = (act and tostring(act.snapMode))        or "normal"
+
+	-- raycast ลงพื้น โดยไม่ชนกับตัวละคร (ถ้ามี)
+	local origin = baseCF.Position + Vector3.new(0, castFromY, 0)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = character and {character} or {}
+	local hit = workspace:Raycast(origin, Vector3.new(0, -rayLen, 0), params)
+
+	-- เลือกแกน up
+	local up: Vector3
+	if hit then
+		up = (mode == "upright") and Vector3.yAxis or hit.Normal
+		if up.Y < 0 then up = -up end
+	else
+		up = Vector3.yAxis
+	end
+
+	-- กำหนดทิศ yaw (hrp|from|worldZ) แบบปลอดภัย
+	local yawFrom = (act and tostring(act.yawFrom)) or "hrp"
+	local hrp: BasePart? = character and (character:FindFirstChild("HumanoidRootPart") :: BasePart?) or nil
+
+	local fwd: Vector3
+	if yawFrom == "from" then
+		fwd = baseCF.LookVector
+	elseif yawFrom == "worldZ" then
+		fwd = Vector3.zAxis
+	else -- "hrp" (default)
+		fwd = (hrp and hrp.CFrame.LookVector) or baseCF.LookVector
+	end
+
+	-- project ให้ขนานพื้น
+	fwd = fwd - up * fwd:Dot(up)
+	if fwd.Magnitude < 1e-4 then fwd = Vector3.zAxis end
+	fwd = fwd.Unit
+
+	local right = (fwd:Cross(up)).Unit
+	local back  = -fwd
+	local pos   = hit and (hit.Position + up * yoff) or baseCF.Position
+
+	local out = CFrame.fromMatrix(pos, right, up, back)
+	if act and act.offset then out = out * act.offset end
+	return out
+end
+
+
+local function getCharacterOf(tool: Tool): Model?
+	local p = tool.Parent
+	if p and p:IsA("Model") and p:FindFirstChildOfClass("Humanoid") then return p end
+	return nil
+end
+
+local function rigNameFrom(character: Model?): string
+	local hum = character and character:FindFirstChildOfClass("Humanoid")
+	return (hum and hum.RigType == Enum.HumanoidRigType.R6) and "R6" or "R15"
+end
+
+local function isTableEmpty(t: any): boolean
+	return type(t)=="table" and next(t)==nil
+end
+
+-- ----- trail helpers -----
+local function findAttachment(part: BasePart?, name: string): Attachment?
+	if not part then return nil end
+	local a = part:FindFirstChild(name)
+	return (a and a:IsA("Attachment")) and a :: Attachment or nil
+end
+
+local function ensureAttachment(part: BasePart, name: string, pos: Vector3?): Attachment
+	local a = findAttachment(part, name)
+	if not a then
+		a = Instance.new("Attachment")
+		a.Name = name
+		a.Position = pos or Vector3.new()
+		a.Parent = part
+	end
+	return a
+end
+
+local function rewireTrailsToParent(fromPart: BasePart, fxRoot: Instance, a0Name: string, a1Name: string, createIfMissing: boolean, a0Pos: Vector3?, a1Pos: Vector3?)
+	local a0 = findAttachment(fromPart, a0Name)
+	local a1 = findAttachment(fromPart, a1Name)
+	if (not a0 or not a1) and createIfMissing then
+		a0 = ensureAttachment(fromPart, a0Name, a0Pos or Vector3.new(0, 0.30, -0.30))
+		a1 = ensureAttachment(fromPart, a1Name, a1Pos or Vector3.new(0, 0.30, -2.00))
+	end
+	if not (a0 and a1) then return false end
+	for _, d in ipairs(fxRoot:GetDescendants()) do
+		if d:IsA("Trail") then
+			d.Attachment0 = a0
+			d.Attachment1 = a1
+		end
+	end
+	return true
+end
+
+-- ================= Fallback loader (for standalone skills) =================
+local skillCfgCache: {[string]: any} = {}  -- key = moveId
+
+local function findVFXFolder(pkg: Instance?): Instance?
+	if not pkg then return nil end
+	return pkg:FindFirstChild("VFX") or pkg:FindFirstChild("vfx") or pkg:FindFirstChild("Vfx")
+end
+
+local function findVfxConfigModule(vfxFolder: Instance?): ModuleScript?
+	if not vfxFolder then return nil end
+	return (vfxFolder:FindFirstChild("VfxConfig")
+		or vfxFolder:FindFirstChild("vfxconfig")
+		or vfxFolder:FindFirstChild("VFXConfig")) :: ModuleScript?
+end
+
+local function findAssetsRoot(vfxFolder: Instance?): Instance?
+	if not vfxFolder then return nil end
+	return vfxFolder:FindFirstChild("Assets") or vfxFolder
+end
+
+local function loadSkillVfxConfig(moveId: string, rigName: string): any?
+	local cached = skillCfgCache[moveId]
+	if cached ~= nil then return cached end
+
+	local shared = RS:FindFirstChild("Shared"); if not shared then skillCfgCache[moveId] = false; return nil end
+	local skills = shared:FindFirstChild("Skills"); if not skills then skillCfgCache[moveId] = false; return nil end
+
+	for _, pkg in ipairs(skills:GetChildren()) do
+		local anims = pkg:FindFirstChild("Animations")
+		local rf = anims and (anims:FindFirstChild(rigName) or anims:FindFirstChild("R15") or anims:FindFirstChild("R6"))
+		if rf and rf:FindFirstChild(moveId) then
+			local vfxFolder = findVFXFolder(pkg)
+			local cfgMod    = findVfxConfigModule(vfxFolder)
+			if cfgMod and cfgMod:IsA("ModuleScript") then
+				local ok, cfg = pcall(require, cfgMod)
+				if ok and type(cfg) == "table" then
+					cfg.AssetsRoot = cfg.AssetsRoot or findAssetsRoot(vfxFolder)
+					skillCfgCache[moveId] = cfg
+					dbg("FALLBACK CFG  move=%s  from=%s", moveId, short(cfgMod))
+					return cfg
+				end
+			end
+		end
+	end
+
+	skillCfgCache[moveId] = false
+	return nil
+end
+
+function Runner.invalidateCache(moveId: string?)
+	if moveId then
+		skillCfgCache[moveId] = nil
+		dbg("CACHE INVALIDATE  %s", moveId)
+	else
+		for k,_ in pairs(skillCfgCache) do skillCfgCache[k] = nil end
+		dbg("CACHE INVALIDATE ALL")
+	end
+end
+
+-- ================= Emitter preparation (EmitCount/EmitDelay) =================
+local function prepareEmitters(fxRoot: Instance, effect: Effect)
+	effect.timers = effect.timers or {}
+	local nSched, nBurst, nCont = 0, 0, 0
+
+	for _, d in ipairs(fxRoot:GetDescendants()) do
+		if d:IsA("ParticleEmitter") then
+			local pe = d :: ParticleEmitter
+			local ecAttr = pe:GetAttribute("EmitCount")
+			local edAttr = pe:GetAttribute("EmitDelay")
+			local delay = (typeof(edAttr) == "number") and math.max(0, edAttr :: number) or 0
+
+			if typeof(ecAttr) == "number" then
+				local count = math.max(0, math.floor(ecAttr :: number))
+				pe.Enabled = false
+				pcall(function() pe:Clear() end)
+
+				if count == 0 then
+					table.insert(effect.timers, {
+						at = effect.t0 + delay,
+						fn = function() if pe and pe.Parent then pe.Enabled = true end end,
+						note = string.format("pe=%s CONT delay=%.2f", short(pe), delay),
+					})
+					nCont += 1
+					dbg("EMITTER CONT-SCHEDULE  pe=%s  Delay=%.2f", short(pe), delay)
+				else
+					table.insert(effect.timers, {
+						at = effect.t0 + delay,
+						fn = function() if pe and pe.Parent then pe:Emit(count) end end,
+						note = string.format("pe=%s BURST EmitCount=%d Delay=%.2f", short(pe), count, delay),
+					})
+					nSched += 1
+					dbg("EMITTER BURST-SCHEDULE  pe=%s  Count=%d  Delay=%.2f", short(pe), count, delay)
+				end
+			else
+				local b = pe:GetAttribute("BurstCount")
+				if typeof(b) == "number" then
+					pe.Enabled = false
+					pcall(function() pe:Clear() end)
+					pe:Emit(b :: number)
+					nBurst += 1
+					dbg("EMITTER BURST-IMMEDIATE  pe=%s  BurstCount=%d", short(pe), b)
+				else
+					pe.Enabled = true
+					nCont += 1
+					dbg("EMITTER CONT-IMMEDIATE  pe=%s  Enabled=true", short(pe))
+				end
+			end
+
+		elseif d:IsA("Trail") then
+			(d :: Trail).Enabled = true
+		elseif d:IsA("Beam") then
+			(d :: Beam).Enabled = true
+		end
+	end
+
+	dbg("EMITTER SUMMARY  sched=%d  burst=%d  cont=%d  asset=%s", nSched, nBurst, nCont, effect.asset)
+end
+
+-- ================= step resolver (with TRAIL bridge) =================
+-- ================= step resolver (with TRAIL bridge + HIT aliases) =================
+local function extractTrailActions(list: {any}?, typ: "trail_on" | "trail_off"): {any}?
+	if not list or type(list) ~= "table" then return nil end
+	local out = {}
+	for _, act in ipairs(list) do
+		if type(act) == "table" then
+			if typ == "trail_on"  and act.type == "trail_on"  then table.insert(out, act) end
+			if typ == "trail_off" and act.type == "trail_off" then table.insert(out, act) end
+		end
+	end
+	return (#out > 0) and out or nil
+end
+
+-- ================= step resolver (STRICT: no onhit<->hit_on cross-fallback) =================
+local function extractTrailActions(list: {any}?, typ: "trail_on" | "trail_off"): {any}?
+	if not list or type(list) ~= "table" then return nil end
+	local out = {}
+	for _, act in ipairs(list) do
+		if type(act) == "table" then
+			if typ == "trail_on"  and act.type == "trail_on"  then table.insert(out, act) end
+			if typ == "trail_off" and act.type == "trail_off" then table.insert(out, act) end
+		end
+	end
+	return (#out > 0) and out or nil
+end
+
+local function resolveActionsWithBridge(cfg: any, moveId: string, step: string, ctx: {[string]: any}?)
+	local moves = cfg and (cfg.moves or {}) or {}
+	local mv = moves[moveId] or moves._work or moves._default
+	local function pick(key: string)
+		local v = mv and mv[key]
+		return (type(v)=="table" and next(v)~=nil) and v or nil
+	end
+
+	local actions = nil
+
+	-- STRICT mapping:
+	-- • onhit => onhit เท่านั้น (ไม่อนุญาต fallback ไป hit_on)
+	-- • hit_on / hit_off => เฉพาะชื่อเดียวกัน และรองรับ hitN_on / hitN_off แบบมี index
+	-- • step อื่น ๆ => ตรงชื่อ step
+	if step == "onhit" then
+		actions = pick("onhit")
+
+	elseif step == "hit_on" then
+		actions = pick("hit_on")
+		if (not actions) and ctx and tonumber(ctx.hitIndex) then
+			actions = pick(("hit%d_on"):format(tonumber(ctx.hitIndex)))
+		end
+
+	elseif step == "hit_off" then
+		actions = pick("hit_off")
+		if (not actions) and ctx and tonumber(ctx.hitIndex) then
+			actions = pick(("hit%d_off"):format(tonumber(ctx.hitIndex)))
+		end
+
+	else
+		-- รองรับรูปแบบ hitN_on / hitN_off ที่เรียกมาตรงตัว
+		local n, onoff = step:match("^hit(%d+)_(on|off)$")
+		if n and onoff then
+			actions = pick(step) or pick("hit_"..onoff) -- ยัง “ไม่” ข้ามไป onhit
+		else
+			actions = pick(step)
+		end
+	end
+
+	-- ===== TRAIL bridge (กรณีเรียก step=trail_on/off แต่ใน config ไม่มี) =====
+	if (not actions) or (type(actions)=="table" and next(actions)==nil) then
+		if step == "trail_on" and mv then
+			local bridge = extractTrailActions(mv.start, "trail_on")
+			if bridge then actions = bridge; dbg("BRIDGE trail_on <- start  move=%s", moveId) end
+		elseif step == "trail_off" and mv then
+			local bridge = extractTrailActions(mv["end"], "trail_off")
+			if bridge then actions = bridge; dbg("BRIDGE trail_off <- end    move=%s", moveId) end
+		end
+	end
+
+	return actions, mv
+end
+
+function Runner.play(tool: Tool, moveId: string, step: string, ctx: {[string]: any}?)
+	-- ===== local helpers (เฉพาะในฟังก์ชัน) =====
+	local Http = game:GetService("HttpService")
+
+	local function collectFxTrails(root: Instance): {Trail}
+		local out = {}
+		for _,d in ipairs(root:GetDescendants()) do
+			if d:IsA("Trail") then
+				d:SetAttribute("_FromVFX", true)
+				table.insert(out, d)
+			end
+		end
+		return out
+	end
+	local function refreshTrails(trails: {Trail})
+		for _,t in ipairs(trails) do t.Enabled = false; pcall(function() t:Clear() end) end
+		RunS.Heartbeat:Wait()
+		for _,t in ipairs(trails) do t.Enabled = true end
+	end
+	local function ensureUID(inst: Instance?): string
+		if not inst then return "nil" end
+		local uid = inst:GetAttribute("_TrailUID")
+		if type(uid) ~= "string" or uid == "" then
+			uid = Http:GenerateGUID(false)
+			inst:SetAttribute("_TrailUID", uid)
+		end
+		return uid
+	end
+	local function autoTrailTag(fromPart: BasePart?, act: any): string
+		return ("__TRAIL__%s__%s"):format(ensureUID(fromPart), tostring(act and act.asset or "trail"))
+	end
+
+	-- store สำหรับจำ tag ต่อ tool+move
+	Runner.__trailStore = Runner.__trailStore or { byCharMove = setmetatable({}, {__mode="k"}) }
+	local store = Runner.__trailStore.byCharMove
+	store[tool] = store[tool] or {}
+
+	-- ===== 1) registry → 2) fallback (เฉพาะถ้า registry ไม่มี action) =====
+	-- ===== SELECT CFG/ACTIONS (registry vs fallback, with trail merge) =====
+	-- โหลดจาก Catalog (registry)
+	local regCfg = VfxRegistry.get(tool)
+	local regActs, regMv = resolveActionsWithBridge(regCfg, moveId, step, ctx)
+
+	local chFB    = getCharacterOf(tool)
+	local rigName = rigNameFrom(chFB)
+	local fbCfg   = loadSkillVfxConfig(moveId, rigName)
+	local fbActs, fbMv = resolveActionsWithBridge(fbCfg, moveId, step, ctx)
+
+	-- ตัดสินใจว่าจะใช้ชุดไหน + รวมเฉพาะ trail ถ้าของ registry ขาด
+	local cfg, actions, mv, via = regCfg, regActs, regMv, (regCfg and "registry" or "nil")
+	if (not actions) or isTableEmpty(actions) then
+		if fbActs and (not isTableEmpty(fbActs)) then
+			cfg, actions, mv, via = fbCfg, fbActs, fbMv, "fallback (all)"
+		end
+	else
+		-- registry มีแอ็กชันอยู่แล้ว → เติมเฉพาะ trail จาก fallback ถ้าขาด
+		local function hasTrail(list)
+			return hasActType(list, "trail_on") or hasActType(list, "trail_off")
+		end
+		if (not hasTrail(actions)) and fbActs and (not isTableEmpty(fbActs)) then
+			actions = mergeTrailActsIfMissing(actions, fbActs)
+			if hasTrail(actions) then via = "registry +trail" end
+		end
+	end
+
+	dbg("PLAY  move=%s  step=%s  via=%s", moveId, step, via)
+	if not cfg or not actions or isTableEmpty(actions) then
+		dbg("PLAY ABORT  move=%s  step=%s  (no actions)", moveId, step)
+		return
+	end
+
+	-- assetsRoot ให้ชัวร์ (registry → fallback → RS.Assets.VFX)
+	local assetsRoot = (cfg and cfg.AssetsRoot) or (fbCfg and fbCfg.AssetsRoot)
+		or RS:WaitForChild("Assets"):WaitForChild("VFX")
+
+	local character = chFB
+	if not character then
+		dbg("NO CHARACTER for tool %s", short(tool))
+		return
+	end
+
+	-- ===== helper: shallow clone (รวมถึง pe/t ชั้นเดียว)
+	local function shallowClone(t)
+		local o = {}
+		for k,v in pairs(t or {}) do
+			if k=="pe" or k=="t" then
+				local sub = {}
+				for k2,v2 in pairs(v) do sub[k2]=v2 end
+				o[k] = sub
+			else
+				o[k] = v
+			end
+		end
+		return o
+	end
+
+	-- ===== helper: ขยายรายชื่อ asset (assets[] | assetPattern+count | asset+count | asset เดี่ยว)
+	local function expandAssetList(act): {string}
+		local out: {string} = {}
+		if type(act.assets)=="table" and #act.assets>0 then
+			for i=1,#act.assets do
+				local nm = act.assets[i]
+				if type(nm)=="string" then out[#out+1]=nm end
+			end
+			return out
+		end
+		if type(act.assetPattern)=="string" and tonumber(act.count) then
+			local from = tonumber(act.indexFrom) or 1
+			for i=0,(act.count-1) do
+				out[#out+1] = string.format(act.assetPattern, from+i)
+			end
+			return out
+		end
+		if type(act.asset)=="string" and tonumber(act.count) then
+			for i=1,act.count do out[#out+1] = act.asset end
+			return out
+		end
+		if type(act.asset)=="string" then
+			out[1] = act.asset
+		end
+		return out
+	end
+
+	-- ===== helper: progression ต่อชิ้น + ประกอบ act.spawn
+	local function buildPerStepAct(baseShared, assetName: string, i: number, actMulti)
+		local a = shallowClone(baseShared or {})
+		a.type  = "spawn"
+		a.asset = assetName
+
+		local prog = actMulti.progression
+		if prog then
+			if tonumber(prog.scaleMulPerStep) then
+				local mul = 1 + (i-1)*(prog.scaleMulPerStep)
+				if a.scaleMul then a.scaleMul = (tonumber(a.scaleMul) or 1)*mul
+				elseif a.scaleTo then a.scaleTo = (tonumber(a.scaleTo) or 1)*mul
+				else a.scaleMul = mul end
+			end
+			if tonumber(prog.durationAddPerStep) then
+				a.duration = (tonumber(a.duration) or 0.35) + (i-1)*prog.durationAddPerStep
+			end
+			if typeof(prog.offsetStep)=="Vector3" then
+				local stepMove = prog.offsetStep * (i-1)
+				a.offset = (a.offset or CFrame.new()) * CFrame.new(stepMove)
+			end
+			if typeof(prog.rotStep_dps)=="Vector3" then
+				a.t = a.t or {}
+				a.t.rot_dps = (a.t.rot_dps or Vector3.new()) + prog.rotStep_dps*(i-1)
+			end
+		end
+
+		if actMulti.tagBase and actMulti.autoIndexTag ~= false then
+			a.tag = string.format("%s#%d", tostring(actMulti.tagBase), i)
+		end
+		return a
+	end
+
+	-- ===== helper: spawn เดิม (ยกมาทั้งก้อน ไม่แก้ logic)
+	local function spawnOne(act: {[string]: any})
+		-- ✅ กัน “โผล่ซ้ำ” ของเอฟเฟกต์ที่ตั้งใจให้ unique เช่น windup โดยใช้ tag
+		if act.tag and tagAlive(act.tag) then
+			dbg("SPAWN DEDUPE  skip  asset=%s  tag=%s", tostring(act.asset), act.tag)
+			return
+		end
+
+		local fx = take(assetsRoot, act.asset); if not fx then return end
+
+		local partsBase, meshBase = Lib.CaptureScaleBases(fx)
+		local partAlphaBase: {[BasePart]: number} = {}
+		local decalAlphaBase: {[Decal]: number} = {}
+		for p,_ in pairs(partsBase) do partAlphaBase[p] = p.Transparency end
+		for _,d in ipairs(fx:GetDescendants()) do if d:IsA("Decal") then decalAlphaBase[d] = d.Transparency end end
+
+		-- ===== Particle scaling (PE) =====
+		local function mulNS(ns: NumberSequence, f: number): NumberSequence
+			local ks = {}
+			for _, kp in ipairs(ns.Keypoints) do
+				table.insert(ks, NumberSequenceKeypoint.new(kp.Time, kp.Value * f, (kp.Envelope or 0) * f))
+			end
+			return NumberSequence.new(ks)
+		end
+		local function mulNR(nr: NumberRange, f: number): NumberRange
+			return NumberRange.new(nr.Min * f, nr.Max * f)
+		end
+
+		local peBase = {
+			size = {} :: {[ParticleEmitter]: NumberSequence},
+			speed = {} :: {[ParticleEmitter]: NumberRange},
+			lifetime = {} :: {[ParticleEmitter]: NumberRange},
+			rate = {} :: {[ParticleEmitter]: number},
+			accel = {} :: {[ParticleEmitter]: Vector3},
+		}
+
+		local function applyParticleScale(root: Instance, peCfg: {[string]: any}?)
+			if not peCfg then return end
+			local sizeMul     = tonumber(peCfg.sizeMul)
+			local speedMul    = tonumber(peCfg.speedMul)
+			local lifetimeMul = tonumber(peCfg.lifetimeMul)
+			local rateMul     = tonumber(peCfg.rateMul)
+			local accelMul    = tonumber(peCfg.accelMul)
+
+			for _, d in ipairs(root:GetDescendants()) do
+				if d:IsA("ParticleEmitter") then
+					local p = d :: ParticleEmitter
+					peBase.size[p]     = p.Size
+					peBase.speed[p]    = p.Speed
+					peBase.lifetime[p] = p.Lifetime
+					peBase.rate[p]     = p.Rate
+					peBase.accel[p]    = p.Acceleration
+					if sizeMul     then p.Size         = mulNS(p.Size, sizeMul) end
+					if speedMul    then p.Speed        = mulNR(p.Speed, speedMul) end
+					if lifetimeMul then p.Lifetime     = mulNR(p.Lifetime, lifetimeMul) end
+					if rateMul     then p.Rate         = math.max(0, p.Rate * rateMul) end
+					if accelMul    then p.Acceleration = p.Acceleration * accelMul end
+				end
+			end
+		end
+		-- รองรับทั้ง pe = {...} และ peScale = 0.35 (ชอร์ตคัทสำหรับ size)
+		applyParticleScale(fx, (act.pe or (act.peScale and { sizeMul = act.peScale })))
+
+		local function applyAlpha(alpha: number)
+			alpha = math.clamp(alpha or 1, 0, 1)
+			local t = 1 - alpha
+			for p,baseT in pairs(partAlphaBase)  do if p and p.Parent then p.Transparency = math.max(baseT or 0, t) end end
+			for d,baseT in pairs(decalAlphaBase) do if d and d.Parent then d.Transparency = math.max(baseT or 0, t) end end
+		end
+		local function resetInstance()
+			for p,sz in pairs(partsBase)  do if p and p.Parent then p.Size  = sz end end
+			for m,sc in pairs(meshBase)   do if m and m.Parent then m.Scale = sc end end
+			for p,tr in pairs(partAlphaBase)  do if p and p.Parent then p.Transparency = tr end end
+			for d,tr in pairs(decalAlphaBase) do if d and d.Parent then d.Transparency = tr end end
+			-- คืนค่าพารามิเตอร์อนุภาค
+			for p, v in pairs(peBase.size)     do if p and p.Parent then p.Size         = v end end
+			for p, v in pairs(peBase.speed)    do if p and p.Parent then p.Speed        = v end end
+			for p, v in pairs(peBase.lifetime) do if p and p.Parent then p.Lifetime     = v end end
+			for p, v in pairs(peBase.rate)     do if p and p.Parent then p.Rate         = v end end
+			for p, v in pairs(peBase.accel)    do if p and p.Parent then p.Acceleration = v end end
+
+			for _,d in ipairs(fx:GetDescendants()) do
+				if d:IsA("Trail") then d.Enabled=false; pcall(function() d:Clear() end) end
+			end
+		end
+
+		local function makeEffect(parentedToWorld: boolean)
+			local baseCF: CFrame
+			if act.useImpactPoint and ctx and ctx.hitPos then
+				local yaw = tostring(act.yawFrom or "worldZ")
+				local hrp: BasePart? = character and (character:FindFirstChild("HumanoidRootPart") :: BasePart?) or nil
+				local look: Vector3
+				if yaw == "hrp" and hrp then
+					look = hrp.CFrame.LookVector
+				elseif yaw == "from" then
+					look = Vector3.zAxis -- “from” ในเคสนี้ไม่มี fromPart ที่แน่ชัด → ยึด worldZ
+				else
+					look = Vector3.zAxis -- default
+				end
+				local hitPos: Vector3 = ctx.hitPos
+				baseCF = CFrame.new(hitPos, hitPos + look)
+			else
+				local fromPart = Lib.FindAttachTarget(tool, character,
+					(parentedToWorld and (act.from or "Handle")) or (act.attach or "Handle"))
+				baseCF = toCFrameOf(fromPart, nil)
+			end
+
+			if parentedToWorld then
+				if (act.snapGround==true) or (act.snapToGround==true) or (act.ground==true) then
+					baseCF = snapToGroundBasis(baseCF, character, act)
+				else
+					if act.offset then baseCF = baseCF * act.offset end
+				end
+			end
+
+			local t0 = now(); local rot = Vector3.new()
+			local e: Effect = {
+				inst=fx, asset=act.asset, assetsRoot=assetsRoot, t0=t0, dur=(act.duration or 0.35), tag=act.tag,
+				update=function(dt)
+					local t = now() - t0
+
+					local scl
+					if act.t and act.t.scale then
+						scl = eval(act.t.scale, t)
+					else
+						local to = tonumber(act.scaleTo or act.growTo or act.scaleMul)
+						if to and to ~= 1 then
+							local from = tonumber(act.scaleFrom) or 1
+							local dur  = tonumber(act.scaleDuration or act.duration) or 0
+							local a = (dur>0) and math.clamp(t/dur,0,1) or 1
+							scl = from + (to-from)*a
+						end
+					end
+					if scl then Lib.ApplyUniformScale(fx, scl, partsBase, meshBase) end
+
+					local alp
+					if act.t and act.t.alpha then
+						alp = eval(act.t.alpha, t)
+					else
+						local toA = act.fadeTo
+						if toA == nil then
+							if act.fadeOut == true then toA = 0 end
+							if act.fadeIn  == true then toA = 1 end
+						end
+						if toA ~= nil then
+							local fromA = (act.fadeFrom ~= nil) and act.fadeFrom or (act.fadeOut and 1) or (act.fadeIn and 0) or 1
+							local durA  = tonumber(act.fadeDuration or act.duration) or 0
+							local aA = (durA>0) and math.clamp(t/durA,0,1) or 1
+							alp = fromA + (toA-fromA)*aA
+						end
+					end
+					if alp ~= nil then applyAlpha(alp) end
+
+					if act.t and act.t.rot_dps then
+						local rot_dps: Vector3 = act.t.rot_dps
+						rot += rot_dps*dt
+					end
+
+					local cf
+					if parentedToWorld then
+						cf = baseCF * CFrame.Angles(math.rad(rot.X),math.rad(rot.Y),math.rad(rot.Z))
+					else
+						local targetPart = Lib.FindAttachTarget(tool, character, act.attach or "Handle")
+						if not targetPart then return end
+						cf = targetPart.CFrame * (act.offset or CFrame.new())
+							* CFrame.Angles(math.rad(rot.X),math.rad(rot.Y),math.rad(rot.Z))
+					end
+
+					if fx:IsA("BasePart") then
+						(fx :: BasePart).CFrame = cf
+					elseif fx:IsA("Model") then
+						local mdl = fx :: Model
+						local pp  = mdl.PrimaryPart or mdl:FindFirstChildOfClass("BasePart")
+						if pp then
+							local off = pp.CFrame:ToObjectSpace(mdl:GetPivot())
+							mdl:PivotTo(cf * off)
+						else
+							mdl:PivotTo(cf)
+						end
+					else
+						for _,d in ipairs(fx:GetDescendants()) do
+							if d:IsA("BasePart") then d.CFrame = cf end
+						end
+					end
+				end,
+				finish=function() resetInstance() end,
+				timers = {},
+			}
+			prepareEmitters(fx, e)
+			addEffect(e)
+		end
+
+		if act.space=="world" or (act.useImpactPoint and ctx and ctx.hitPos) then
+			fx.Parent = workspace
+			Lib.SanitizeNoPhysics(fx)
+			makeEffect(true)
+			dbg("SPAWN WORLD  asset=%s  parent=%s", act.asset, "workspace")
+		else
+			local targetPart = Lib.FindAttachTarget(tool, character, act.attach or "Handle")
+			if not targetPart then give(assetsRoot, act.asset, fx); return end
+			fx.Parent = targetPart
+			Lib.SanitizeNoPhysics(fx)
+			makeEffect(false)
+			dbg("SPAWN ATTACH asset=%s  parent=%s", act.asset, short(targetPart))
+		end
+	end
+
+	for _, act in ipairs(actions) do
+		if act.type == "stop" and act.tag then
+			stopByTag(act.tag)
+
+		elseif act.type == "trail_on" then
+			local fromName = act.from or "Handle"
+			local fromPart = Lib.FindAttachTarget(tool, character, fromName)
+			if fromPart and assetsRoot and assetsRoot:FindFirstChild(act.asset) then
+				local fx = take(assetsRoot, act.asset)
+				if fx then
+					fx.Parent = fromPart
+					Lib.SanitizeNoPhysics(fx)
+
+					-- ย้าย Trail ใน FX ให้ชี้ Attachment ของ parent (เช่น HRP)
+					local a0Name = tostring(act.attach0 or "TrailStart")
+					local a1Name = tostring(act.attach1 or "TrailEnd")
+					local makeAttach = (act.createParentAttachments ~= false)
+					rewireTrailsToParent(
+						fromPart, fx, a0Name, a1Name, makeAttach,
+						(act.attach0Offset :: Vector3?) or nil,
+						(act.attach1Offset :: Vector3?) or nil
+					)
+
+					-- เปิดเฉพาะ trail ที่ "อยู่ใน FX" (ไม่ยุ่ง trail อื่น)
+					local fxTrails = collectFxTrails(fx)
+					refreshTrails(fxTrails)
+
+					-- ทำ tag อัตโนมัติถ้าไม่ได้กำหนดมา และจำไว้ต่อ tool+moveId
+					local tag = act.tag or autoTrailTag(fromPart, act)
+					store[tool][moveId] = { tag = tag, from = fromName, asset = act.asset }
+
+					local e: Effect = {
+						inst=fx, asset=act.asset, assetsRoot=assetsRoot, t0=now(),
+						dur=(act.duration or 0.5), tag=tag,
+						update=function(_) end,
+						finish=function() for _,t in ipairs(fxTrails) do t.Enabled = false end end,
+						timers = {},
+					}
+					prepareEmitters(fx, e)
+					addEffect(e)
+					dbg("TRAIL ON  move=%s  tag=%s  asset=%s", tostring(moveId), tostring(tag), tostring(act.asset))
+				end
+			end
+
+		elseif act.type == "trail_off" then
+			-- ปิดเฉพาะ FX ที่เราเปิดไว้ โดยใช้ tag ที่จำไว้
+			local rec = store[tool][moveId]
+			local tag = (act and act.tag) or (rec and rec.tag)
+			if not tag then
+				-- เดา tag จาก fromPart เดิม (กันกรณี config ไม่ส่ง tag มา)
+				local fromName = (act and act.from) or (rec and rec.from) or ((moveId=="slide" or moveId=="dash") and "HRP") or "Handle"
+				local fromPart = Lib.FindAttachTarget(tool, character, fromName)
+				tag = autoTrailTag(fromPart, rec or act)
+			end
+			if tag then
+				stopByTag(tag)
+				dbg("TRAIL OFF move=%s tag=%s", tostring(moveId), tostring(tag))
+			else
+				dbg("TRAIL OFF move=%s (no tag)", tostring(moveId))
+			end
+			store[tool][moveId] = nil
+
+			-- 🔹 เพิ่ม: multi/bulk – เล่นต่อคิว (spawn_seq) หรือพร้อมกันแบบ stagger (spawn_par)
+		elseif act.type == "spawn_seq" or act.type == "spawn_par" then
+			local list = expandAssetList(act)
+			if #list == 0 then
+				dbg("MULTI ABORT  (no assets)  type=%s", tostring(act.type))
+				continue
+			end
+
+			-- shared params สำหรับทุกชิ้น (อนุญาตยืม field จากตัว act ตรง ๆ เพื่อเขียนสั้น)
+			local shared = shallowClone(act.shared or {})
+			local copyKeys = {
+				"space","from","attach","offset","snapGround","snapToGround","ground","snapMode","yawFrom",
+				"pe","scaleFrom","scaleTo","scaleMul","scaleDuration","fadeIn","fadeOut","fadeTo","fadeFrom",
+				"fadeDuration","duration","t","useImpactPoint"
+			}
+			for _,k in ipairs(copyKeys) do
+				if act[k] ~= nil and shared[k] == nil then shared[k] = act[k] end
+			end
+
+			local t0        = now()
+			local start     = tonumber(act.startDelay) or 0
+			local interval  = (act.type=="spawn_seq") and (tonumber(act.delay) or 0) or (tonumber(act.stagger) or 0)
+
+			for i, name in ipairs(list) do
+				local perAct = buildPerStepAct(shared, name, i, act)
+				local at     = t0 + start + (i-1)*interval
+				schedule(at, function()
+					spawnOne(perAct)
+				end, string.format("multi %s  #%d %s", tostring(act.type), i, name))
+			end
+			-- ตื่นลูปให้แน่ใจ
+			ensureLoop()
+
+		elseif act.type == "spawn" then
+			spawnOne(act)
+		end
+	end
+
+	-- เผื่อกรณีมีแต่ pendingTimers แต่ยังไม่มี effect ใด ๆ
+	ensureLoop()
+end
+
+function Runner.stopAll()
+	for _, e in ipairs(running) do e.dur = 0 end
+	dbg("STOP ALL")
+end
+
+function Runner.warm(tool: Tool, moveId: string)
+	local cfg = VfxRegistry.get(tool)
+	local moves = cfg and (cfg.moves or {}) or {}
+	local mv = moves[moveId] or moves._work or moves._default
+	local actions = mv
+	if not actions then
+		local character = tool.Parent :: Model?
+		local rigName = (character and character:FindFirstChildOfClass("Humanoid")
+			and (character:FindFirstChildOfClass("Humanoid").RigType == Enum.HumanoidRigType.R6 and "R6" or "R15")) or "R15"
+		local scfg = (function() return nil end)()
+		if scfg then cfg = scfg; mv = (scfg.moves or {})[moveId] end
+	end
+	if not cfg or not mv then return end
+	local assetsRoot = cfg.AssetsRoot
+	if not assetsRoot then return end
+
+	-- helper สำหรับ multi
+	local function listFromAct(act): {string}
+		local out: {string} = {}
+		if (act.type=="spawn" or act.type=="trail_on") and type(act.asset)=="string" then
+			out[1] = act.asset
+			return out
+		end
+		if (act.type=="spawn_seq" or act.type=="spawn_par") then
+			if type(act.assets)=="table" and #act.assets>0 then
+				for i=1,#act.assets do
+					local nm = act.assets[i]
+					if type(nm)=="string" then out[#out+1]=nm end
+				end
+				return out
+			end
+			if type(act.assetPattern)=="string" and tonumber(act.count) then
+				local from = tonumber(act.indexFrom) or 1
+				for i=0,(act.count-1) do out[#out+1] = string.format(act.assetPattern, from+i) end
+				return out
+			end
+			if type(act.asset)=="string" and tonumber(act.count) then
+				for i=1,act.count do out[#out+1] = act.asset end
+				return out
+			end
+		end
+		return out
+	end
+
+	for step, list in pairs(mv) do
+		if type(list) == "table" then
+			for _, act in ipairs(list) do
+				local names = listFromAct(act)
+				for _, nm in ipairs(names) do
+					local fx = take(assetsRoot, nm)
+					if fx then give(assetsRoot, nm, fx) end
+				end
+			end
+		end
+	end
+	dbg("WARM  move=%s  assetsRoot=%s", moveId, short(assetsRoot))
+end
+
+
+
+-- ▼▼ ADD into ReplicatedStorage/Shared/VFX/VfxRunner.lua (just above "return Runner") ▼▼
+function Runner.playAt(assetName: string, where: CFrame, opts: {[string]: any}?)
+	-- root หา asset: ใช้ Assets/VFX กลาง
+	local assetsRoot = RS:WaitForChild("Assets"):WaitForChild("VFX")
+	if type(assetName) ~= "string" or assetName == "" then return false end
+	local src = assetsRoot:FindFirstChild(assetName)
+	if not src then
+		dbg("playAt: asset '%s' not found", tostring(assetName))
+		return false
+	end
+
+	-- อ่าน attribute จาก asset (override ด้วย opts ถ้ามี)
+	local function numAttr(inst: Instance, k: string, def: number?): number?
+		local v = inst:GetAttribute(k); v = (typeof(v)=="number") and v or def; return v
+	end
+	local function boolAttr(inst: Instance, k: string, def: boolean?): boolean?
+		local v = inst:GetAttribute(k); v = (typeof(v)=="boolean") and v or def; return v
+	end
+	local function vecAttr(inst: Instance, k: string): Vector3?
+		local v = inst:GetAttribute(k); return (typeof(v)=="Vector3") and (v :: Vector3) or nil
+	end
+	local function strAttr(inst: Instance, k: string): string?
+		local v = inst:GetAttribute(k); return (typeof(v)=="string") and (v :: string) or nil
+	end
+
+	local duration = (opts and tonumber(opts.duration))
+		or numAttr(src, "Duration", nil)
+		or numAttr(src, "duration", nil)
+		or numAttr(src, "Lifetime", nil)
+		or 0.6
+
+	local fadeOut      = (opts and opts.fadeOut ~= nil) and not not opts.fadeOut or (boolAttr(src, "FadeOut", nil))
+	local fadeIn       = (opts and opts.fadeIn  ~= nil) and not not opts.fadeIn  or (boolAttr(src, "FadeIn",  nil))
+	local fadeTo       = (opts and tonumber(opts.fadeTo))       or numAttr(src, "FadeTo", nil)
+	local fadeFrom     = (opts and tonumber(opts.fadeFrom))     or numAttr(src, "FadeFrom", nil)
+	local fadeDuration = (opts and tonumber(opts.fadeDuration)) or numAttr(src, "FadeDuration", nil)
+
+	local rot = (opts and opts.rot_dps) or vecAttr(src, "RotDPS")
+	if not rot then
+		local rx = numAttr(src, "RotX", 0) or 0
+		local ry = numAttr(src, "RotY", 0) or 0
+		local rz = numAttr(src, "RotZ", 0) or 0
+		rot = Vector3.new(rx, ry, rz)
+	end
+
+	local scaleTo       = (opts and tonumber(opts.scaleTo))       or numAttr(src, "ScaleTo", nil)
+	local scaleFrom     = (opts and tonumber(opts.scaleFrom))     or numAttr(src, "ScaleFrom", nil)
+	local scaleMul      = (opts and tonumber(opts.scaleMul))      or numAttr(src, "ScaleMul", nil)
+	local scaleDuration = (opts and tonumber(opts.scaleDuration)) or numAttr(src, "ScaleDuration", nil)
+
+	local snapGround = (opts and opts.snapGround ~= nil) and not not opts.snapGround
+		or (boolAttr(src, "SnapToGround", nil)) or (boolAttr(src, "Ground", nil)) or false
+	local snapMode = (opts and tostring(opts.snapMode)) or strAttr(src, "SnapMode") or "normal"
+	local yawFrom  = (opts and tostring(opts.yawFrom))  or strAttr(src, "YawFrom")  or "worldZ"
+	local groundOffset  = numAttr(src, "GroundOffset", 0.05) or 0.05
+	local groundCastLen = numAttr(src, "GroundCastLen", 30)   or 30
+	local groundCastY   = numAttr(src, "GroundCastFromY", 4)  or 4
+
+	-- สร้าง instance จาก pool
+	local fx = take(assetsRoot, assetName)
+	if not fx then return false end
+
+	-- เก็บค่า base ไว้ reset ตอนจบ
+	local partsBase, meshBase = Lib.CaptureScaleBases(fx)
+	local partAlphaBase: {[BasePart]: number} = {}
+	local decalAlphaBase: {[Decal]: number} = {}
+	for _,d in ipairs(fx:GetDescendants()) do
+		if d:IsA("BasePart") then partAlphaBase[d] = d.Transparency end
+		if d:IsA("Decal")    then decalAlphaBase[d] = d.Transparency end
+	end
+
+	-- helper: apply/reset alpha
+	local function applyAlpha(alpha: number)
+		alpha = math.clamp(alpha or 1, 0, 1)
+		local t = 1 - alpha
+		for p,baseT in pairs(partAlphaBase)  do if p and p.Parent then p.Transparency = math.max(baseT or 0, t) end end
+		for d,baseT in pairs(decalAlphaBase) do if d and d.Parent then d.Transparency = math.max(baseT or 0, t) end end
+	end
+	local function resetInstance()
+		for p,sz in pairs(partsBase)  do if p and p.Parent then p.Size  = sz end end
+		for m,sc in pairs(meshBase)   do if m and m.Parent then m.Scale = sc end end
+		for p,tr in pairs(partAlphaBase)  do if p and p.Parent then p.Transparency = tr end end
+		for d,tr in pairs(decalAlphaBase) do if d and d.Parent then d.Transparency = tr end end
+		for _,d in ipairs(fx:GetDescendants()) do
+			if d:IsA("Trail") then d.Enabled=false; pcall(function() d:Clear() end) end
+		end
+	end
+
+	-- snap ground/yaw (ใช้ character=nil → ใช้ worldZ)
+	local baseCF = where
+	if snapGround then
+		baseCF = (function()
+			return snapToGroundBasis(where, nil, {
+				groundCastFromY = groundCastY,
+				groundCastLen   = groundCastLen,
+				groundOffset    = groundOffset,
+				snapMode        = snapMode,
+				yawFrom         = yawFrom,
+			})
+		end)()
+	end
+
+	-- เตรียมปล่อยอนุภาคแบบ burst/delay ตาม EmitCount/EmitDelay
+	local e: any = { inst=fx, asset=assetName, assetsRoot=assetsRoot, t0=now(), dur=duration or 0.6, tag=nil, update=function() end, finish=function() end, timers={} }
+	prepareEmitters(fx, e)
+
+	-- parent → world
+	fx.Parent = workspace
+	Lib.SanitizeNoPhysics(fx)
+
+	-- ตั้งค่าเริ่มต้น
+	local t0 = now()
+	local rotAcc = Vector3.new()
+	local hasScaleAnim = (scaleTo ~= nil) or (scaleMul ~= nil)
+	local hasFadeAnim  = (fadeOut or fadeIn or fadeTo ~= nil)
+
+	e.update = function(dt: number)
+		local t = now() - t0
+
+		-- scale (uniform)
+		if hasScaleAnim then
+			local to = scaleTo or scaleMul
+			if to and to ~= 1 then
+				local from = (scaleFrom ~= nil) and scaleFrom or 1
+				local dur  = (scaleDuration ~= nil) and scaleDuration or (duration or 0.6)
+				local a = (dur>0) and math.clamp(t/dur,0,1) or 1
+				local s = from + (to-from)*a
+				Lib.ApplyUniformScale(fx, s, partsBase, meshBase)
+			end
+		end
+
+		-- alpha/fade
+		if hasFadeAnim then
+			local toA = fadeTo
+			if toA == nil then
+				if fadeOut then toA = 0 end
+				if fadeIn  then toA = 1 end
+			end
+			if toA ~= nil then
+				local fromA = (fadeFrom ~= nil) and fadeFrom or (fadeOut and 1) or (fadeIn and 0) or 1
+				local durA  = (fadeDuration ~= nil) and fadeDuration or (duration or 0.6)
+				local aA = (durA>0) and math.clamp(t/durA,0,1) or 1
+				local alp = fromA + (toA-fromA)*aA
+				applyAlpha(alp)
+			end
+		end
+
+		-- rotation (deg/sec)
+		if rot and (rot.Magnitude > 0) then
+			rotAcc += rot*dt
+		end
+
+		local cf = baseCF * CFrame.Angles(math.rad(rotAcc.X), math.rad(rotAcc.Y), math.rad(rotAcc.Z))
+		if fx:IsA("BasePart") then
+			(fx :: BasePart).CFrame = cf
+		elseif fx:IsA("Model") then
+			local mdl = fx :: Model
+			local pp  = mdl.PrimaryPart or mdl:FindFirstChildOfClass("BasePart")
+			if pp then
+				local off = pp.CFrame:ToObjectSpace(mdl:GetPivot())
+				mdl:PivotTo(cf * off)
+			else
+				mdl:PivotTo(cf)
+			end
+		else
+			for _,d in ipairs(fx:GetDescendants()) do
+				if d:IsA("BasePart") then d.CFrame = cf end
+			end
+		end
+	end
+
+	e.finish = function()
+		resetInstance()
+	end
+
+	addEffect(e)
+	dbg("playAt: '%s' dur=%.2f fade=%s/%s rot=%s", assetName, duration or 0.6, tostring(fadeIn), tostring(fadeOut), tostring(rot))
+	return true
+end
+-- ▲▲ ADD END ▲▲
+
+
+return Runner

@@ -1,0 +1,1288 @@
+--!strict
+-- StarterPlayerScripts/FXBusBoot.client.lua
+-- FXBus (client-to-client) สำหรับรีซอส:
+--  • anchor "marker" = caster/resource ; anchor "onhit" = impact point (pos) FIRST
+--  • Catalog-first (VFX/SFX) → Alias → spark (เฉพาะกรณีไม่มีของเล่น)
+--  • Dedupe 100ms ด้วย (kind, moveId, posGrid10)
+-- ไม่กวน HitFx ของผู้เล่น/มอน
+
+
+-- ==== CATALOG MODE SWITCHES ====
+-- ==== CATALOG MODE SWITCHES ====
+local FORCE_CATALOG_ONLY = true   -- ข้ามบล็อก VfxRunner.play (ตัวใหญ่) ใน playMoveStep
+local ALLOW_SPARK = false         -- ปิดสปาร์คเซฟตี้ (กัน visual รบกวน)
+
+-- ==== CATALOG MODE SWITCHES ====
+local RS = game:GetService("ReplicatedStorage")
+local Http      = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+
+
+
+-- [PATCH RB SFX] ===== Resource-break SFX helpers =====
+-- [PATCH RB SFX] ===== Resource-break SFX helpers (Assets-first + safe finder) =====
+local Workspace = game:GetService("Workspace")
+local Debris    = game:GetService("Debris")
+
+-- === Ghost Tool cache (char -> catalog -> instance) ===
+local _GHOST = setmetatable({}, {__mode="k"}) :: {[Model]: {[string]: Instance}}
+
+local function GetGhostTool(ch: Model, cat: string): Instance
+	if not ch or cat == "" then return nil end
+	local m = _GHOST[ch]; if not m then m = {}; _GHOST[ch] = m end
+	local t = m[cat]
+	if t and t.Parent then return t end
+	-- ใช้ Folder แทน Tool เพื่อไม่ชนระบบ Roblox Tool
+	local f = Instance.new("Folder")
+	f.Name = "_GhostTool_" .. cat
+	f:SetAttribute("VfxCatalog", cat)  -- ให้ registry อ่านคาตาล็อกได้
+	f:SetAttribute("ToolClass",  cat)  -- เผื่อโค้ดคุณดู ToolClass
+	f.Parent = ch
+	m[cat] = f
+	return f
+end
+
+
+-- โฟลเดอร์ SFX ที่จะสแกน (เรียงลำดับ: Assets/SFX ก่อน แล้วค่อย Shared/SFX)
+local SFX_ROOTS = (function()
+	local roots = {}
+	if RS:FindFirstChild("Assets") and RS.Assets:FindFirstChild("SFX") then table.insert(roots, "Assets/SFX") end
+	if RS:FindFirstChild("Shared") and RS.Shared:FindFirstChild("SFX") then table.insert(roots, "Shared/SFX") end
+	if #roots == 0 then roots = { "Assets/SFX", "Shared/SFX" } end
+	return roots
+end)()
+
+local function _resolve(path: string): Instance?
+	local node: Instance = RS
+	for seg in string.gmatch(path, "[^/]+") do
+		node = node:WaitForChild(seg, 10)
+		if not node then return nil end
+	end
+	return node
+end
+
+-- รอให้โฟลเดอร์ SFX โผล่ก่อน เพื่อกัน negative-cache ตอนบูต
+local function _waitSfxRoots()
+	for _,p in ipairs(SFX_ROOTS) do _resolve(p) end
+end
+_waitSfxRoots()
+
+-- แคชเสียงแบบ “ยอมรีสแกนได้” (ไม่ล็อคว่าไม่มีถาวร)
+local _SFX_CACHE : {[string]: Sound | boolean} = {}
+
+local function findSfxByName(name: string): Sound?
+	if not name or name == "" then return nil end
+
+	-- ถ้าเคยเจอและยังอยู่ในเกม ให้ใช้เลย
+	if _SFX_CACHE[name] and _SFX_CACHE[name] ~= false then
+		local snd = _SFX_CACHE[name] :: Sound
+		if snd.Parent then return snd else _SFX_CACHE[name] = nil end
+	end
+	-- ถ้าเคย mark ว่าไม่มี ให้ล้างหนึ่งครั้งเพื่อรีสแกน
+	if _SFX_CACHE[name] == false then _SFX_CACHE[name] = nil end
+
+	for _, p in ipairs(SFX_ROOTS) do
+		local root = _resolve(p)
+		if root then
+			local top = root:FindFirstChild(name)
+			if top and top:IsA("Sound") then
+				_SFX_CACHE[name] = top :: Sound
+				return top :: Sound
+			end
+			for _,x in ipairs(root:GetDescendants()) do
+				if x:IsA("Sound") and x.Name == name then
+					_SFX_CACHE[name] = x :: Sound
+					return x :: Sound
+				end
+			end
+		end
+	end
+
+	_SFX_CACHE[name] = false
+	return nil
+end
+
+-- คืน “ฟังก์ชันเล่นเสียง” เสมอ (no-op ถ้าไม่เจอ)
+local function sfxcat(name: string)
+	return function(pos: Vector3?)
+		local template = findSfxByName(name)
+		if not template then
+			if DEBUG then warn("SFX missing (deferred):", name) end
+			return
+		end
+		local anchor: BasePart? = nil
+		if pos then
+			anchor = Instance.new("Part")
+			anchor.Name = "SfxPoint"
+			anchor.Anchored = true
+			anchor.CanCollide = false
+			anchor.CanTouch = false
+			anchor.CanQuery = false
+			anchor.Transparency = 1
+			anchor.Size = Vector3.new(0.2, 0.2, 0.2)
+			anchor.CFrame = CFrame.new(pos)
+			anchor.Parent = Workspace
+		end
+		local sound = template:Clone()
+		sound.Parent = anchor or Workspace
+		-- ปรับ rolloff ให้ได้ยินชัด (กันเบาเกิน)
+		pcall(function()
+			sound.Volume = math.max(sound.Volume, 0.8)
+			sound.RollOffMode = Enum.RollOffMode.Inverse
+			sound.RollOffMinDistance = 6
+			sound.RollOffMaxDistance = 128
+		end)
+		sound:Play()
+
+		local t = (sound.TimeLength and sound.TimeLength > 0) and sound.TimeLength or 1.5
+		Debris:AddItem(sound, t + 0.5)
+		if anchor then Debris:AddItem(anchor, t + 1.0) end
+	end
+end
+
+-- map ชนิด resource → handler (เป็นฟังก์ชันจริง ๆ)
+local RB_CAT = {
+	tree    = sfxcat("resource_break_tree"),
+	rock    = sfxcat("resource_break_rock"),
+	default = sfxcat("resource_break"),
+}
+
+-- ใช้งานได้หลายแบบ:
+--   playResourceBreakSfx("tree", Vector3.new(...))
+--   playResourceBreakSfx(CFrame.new(...), { type="rock" })
+--   playResourceBreakSfx(Vector3.new(...), { resourceType="tree" })
+-- ===== FINAL: playResourceBreakSfx (Assets-first; เดา type ชัวร์) =====
+local function playResourceBreakSfx(a:any, b:any)
+	local rbType: string? = nil
+	local pos: Vector3? = nil
+
+	-- ดึงค่าพื้นฐานจากอาร์กิวเมนต์
+	if typeof(a) == "string" or a == nil then
+		rbType = a
+		if typeof(b) == "Vector3" then pos = b end
+	elseif typeof(a) == "CFrame" then
+		pos = a.Position
+		if type(b) == "table" then rbType = (b.type or b.resourceType) end
+	elseif typeof(a) == "Vector3" then
+		pos = a
+		if type(b) == "table" then rbType = (b.type or b.resourceType) end
+	elseif type(a) == "table" then
+		rbType = (a.type or a.resourceType)
+		if typeof(b) == "Vector3" then pos = b end
+	end
+
+	-- ถ้ายังไม่มี type → ลอง resolve จาก cache/qpos → สุดท้าย default = tree
+	if (not rbType or rbType == "") and type(b) == "table" then
+		if b.qpos then
+			rbType = ResolveResourceType({ qpos = b.qpos })
+		end
+	end
+	if (not rbType or rbType == "") then
+		rbType = "tree"
+	end
+
+	rbType = tostring(rbType or "tree"):lower()
+
+	-- map ไป handler จริงตามชนิด
+	local fn = RB_CAT[rbType] or RB_CAT.default
+	if type(fn) == "function" then fn(pos) end
+end
+
+-- [END PATCH RB SFX] ==================================
+
+-- [END PATCH RB SFX] ==================================
+
+
+
+local Shared = RS:WaitForChild("Shared")
+local FX     = Shared:WaitForChild("FX")
+local Remote = FX:WaitForChild("FXBusRemote") :: RemoteEvent
+
+-- optional deps (safe pcall)
+local hasMain, FXBus         = pcall(function() return require(RS.Shared.FX.FXBus) end)
+local VfxRunnerOk, VfxRunner = pcall(function() return require(RS.Shared.VFX.VfxRunner) end)
+local VfxCoreOk,   VfxCore   = pcall(function() return require(RS.Shared.VFX.VfxCore)   end)
+local SfxRouterOk, SfxRouter = pcall(function() return require(RS.Shared.SFX.SfxRouter) end)
+
+-- คาตาล็อก VFX ของรีซอส (สำหรับอ่าน spec projectile)
+local VFXCAT_OK, VFXCAT = pcall(function()
+	return require(RS.Shared.VFX.Catalog.resourcevfx.resourcevfx)
+end)
+
+-- ตัวช่วยหา node ตาม path ใต้ RS (เช่น "Assets/VFX/Projectiles/OreBall")
+local function _resolveNode(path: string): Instance?
+	if type(path) ~= "string" or path == "" then return nil end
+	local node: Instance = RS
+	for seg in string.gmatch(path, "[^/]+") do
+		node = node:FindFirstChild(seg)
+		if not node then return nil end
+	end
+	return node
+end
+
+
+type Proj = {
+	id: string,
+	inst: Instance,
+	origin: Vector3,
+	dir: Vector3,
+	speed: number,
+	spawnT: number,
+	life: number,
+}
+local _PROJ: {[string]: Proj} = {}
+
+local function _makeCF(pos: Vector3, dir: Vector3): CFrame
+	local look = pos + (dir.Magnitude > 1e-4 and dir.Unit or Vector3.new(0,0,-1))
+	return CFrame.lookAt(pos, look)
+end
+
+local function _cloneByPath(path: string): Instance?
+	local node = _resolveNode(path); if not node then return nil end
+	local ok, clone = pcall(function() return node:Clone() end)
+	return ok and clone or nil
+end
+
+local function _ensurePrimary(m: Model)
+	if m.PrimaryPart then return end
+	for _,x in ipairs(m:GetDescendants()) do
+		if x:IsA("BasePart") then m.PrimaryPart = x; return end
+	end
+end
+
+-- สร้างโมเดลกระสุนจากสเปคใน resourcevfx.lua (step="projectile")
+-- ===== ALWAYS-SPAWN projectile (catalog optional) =====
+local function _spawnClientProjectileFromCatalog(moveId: string, payload: {[string]: any})
+	-- 1) pull basics from payload
+	local id     = tostring(payload.shotId or Http:GenerateGUID(false))
+	local origin = (typeof(payload.origin)=="Vector3" and payload.origin) or Vector3.zero
+	local dir    = (typeof(payload.dir)   =="Vector3" and payload.dir)    or Vector3.new(0,0,-1)
+	local speed  = tonumber(payload.speed) or 120
+	local life   = tonumber(payload.life)  or 2.5
+
+	-- 2) try read spec from catalog, but DO NOT depend on it
+	local spec: any = nil
+	if VFXCAT_OK and VFXCAT and typeof(VFXCAT.Get)=="function" then
+		local ok, _key, opts = pcall(function() return VFXCAT.Get(moveId, "projectile", payload) end)
+		if ok and type(opts)=="table" and type(opts.vfx)=="table" and type(opts.vfx.proj)=="table" then
+			spec = opts.vfx.proj
+		end
+	end
+
+	-- 3) build instance (prefer modelPath, else fallback neon ball)
+	local inst: Instance?
+	if spec and type(spec.modelPath)=="string" and spec.modelPath~="" then
+		inst = _cloneByPath(spec.modelPath)
+	end
+	if not inst then
+		local p = Instance.new("Part")
+		p.Shape = Enum.PartType.Ball
+		p.Material = Enum.Material.Neon
+		p.Size = Vector3.new(0.28,0.28,0.28) * ((spec and tonumber(spec.scale)) or 1)
+		p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery = true,false,false,false
+		inst = p
+	end
+
+	-- 4) place & parent
+	local function _makeCF(pos: Vector3, dir: Vector3): CFrame
+		local look = pos + (dir.Magnitude > 1e-4 and dir.Unit or Vector3.new(0,0,-1))
+		return CFrame.lookAt(pos, look)
+	end
+	if inst:IsA("BasePart") then
+		inst.CFrame = _makeCF(origin, dir)
+	elseif inst:IsA("Model") then
+		_ensurePrimary(inst); inst:PivotTo(_makeCF(origin, dir))
+	end
+	inst.Name = "_proj_"..id
+	inst.Parent = workspace
+
+	-- 5) optional trail (if catalog specified) — safe
+	if spec and type(spec.trail)=="table" and type(spec.trail.path)=="string" and inst:IsA("BasePart") then
+		local src = _cloneByPath(spec.trail.path)
+		if src and src:IsA("Trail") then
+			local a0 = Instance.new("Attachment"); a0.Parent = inst
+			local a1 = Instance.new("Attachment"); a1.Parent = inst
+			src.Attachment0, src.Attachment1 = a0, a1
+			if tonumber(spec.trail.lifetime) then src.Lifetime = spec.trail.lifetime end
+			src.Parent = inst
+		end
+	end
+
+	-- 6) register into client sim
+	_PROJ[id] = {
+		id = id, inst = inst, origin = origin, dir = dir.Unit, speed = speed,
+		spawnT = os.clock(), life = life,
+	}
+
+	if DEBUG then
+		print(("[FXBOOT] spawn proj id=%s pos=(%.1f,%.1f,%.1f) cat=%s"):format(
+			id, origin.X, origin.Y, origin.Z, spec and "yes" or "no"))
+	end
+end
+
+
+local function _killProjectile(id: string, hitPos: Vector3?)
+	local p = _PROJ[id]; if not p then return end
+	if hitPos then
+		local cf = _makeCF(hitPos, p.dir)
+		if p.inst:IsA("BasePart") then p.inst.CFrame = cf
+		elseif p.inst:IsA("Model") then p.inst:PivotTo(cf) end
+	end
+	game.Debris:AddItem(p.inst, 0.05)
+	_PROJ[id] = nil
+end
+
+-- อัปเดตวิ่งกระสุนทุกเฟรม
+RunService.Heartbeat:Connect(function()
+	local now = os.clock()
+	for id, p in pairs(_PROJ) do
+		local t = now - p.spawnT
+		if t > p.life then
+			_killProjectile(id, nil)
+		else
+			local pos = p.origin + p.dir * (p.speed * t)
+			local cf  = _makeCF(pos, p.dir)
+			if p.inst:IsA("BasePart") then p.inst.CFrame = cf
+			elseif p.inst:IsA("Model") then p.inst:PivotTo(cf) end
+		end
+	end
+end)
+
+
+-- resource catalogs
+local VFXCAT_OK, VFXCAT = pcall(function()
+	return require(RS.Shared.VFX.Catalog.resourcevfx.resourcevfx)
+end)
+local SFXCAT_OK, SFXCAT = pcall(function()
+	return require(RS.Shared.SFX.Catalog.resourcesfx.resourcesfx)
+end)
+
+-- ===== Vec3 normalizer (รับ Vector3/CFrame/string 'x,y,z'/table ได้หมด) =====
+local function V3(p:any): Vector3
+	if typeof(p) == "Vector3" then return p end
+	if typeof(p) == "CFrame" then return p.Position end
+	if typeof(p) == "string" then
+		local ax, ay, az = p:match("%s*(-?%d+)%s*,%s*(-?%d+)%s*,%s*(-?%d+)%s*")
+		if ax then
+			-- กรณี qpos เป็นกริด x10 → /10 (ถ้าโปรเจกต์คุณไม่ได้คูณ 10 ก็เอา /10 ออก)
+			return Vector3.new(tonumber(ax)/10, tonumber(ay)/10, tonumber(az)/10)
+		end
+	end
+	if typeof(p) == "table" then
+		-- รองรับทั้ง {x=..,y=..,z=..} และ {[1]=..,[2]=..,[3]=..}
+		local x = rawget(p, "x") or p[1]
+		local y = rawget(p, "y") or p[2]
+		local z = rawget(p, "z") or p[3]
+		if x and y and z then
+			return Vector3.new(tonumber(x), tonumber(y), tonumber(z))
+		end
+	end
+	return Vector3.zero
+end
+
+-- ===== Cache: จำชนิด resource ตาม qpos =====
+local _rbCache: {[string]:{type:string, tier:string}} = {}
+
+local function RbCacheSet(qpos:any, typ:any, tier:any)
+	if not qpos then return end
+	_rbCache[tostring(qpos)] = {
+		type = string.lower(tostring(typ or "")),
+		tier = tostring(tier or "")
+	}
+end
+
+local function ResolveResourceType(p:any): string
+	-- ลำดับ: p.type / p.resourceType / cache[qpos] / ค่าเริ่มต้น 'tree'
+	local t = p and (p.type or p.resourceType) or nil
+	if t and t ~= "" then return string.lower(t) end
+	if p and p.qpos and _rbCache[tostring(p.qpos)] then
+		return _rbCache[tostring(p.qpos)].type
+	end
+	return "tree"
+end
+
+local function PickBreakSfxKey(p:any): string
+	local rtype = ResolveResourceType(p)
+	return (rtype == "tree") and "resource_break_tree" or "resource_break_rock"
+end
+
+
+-- === ORE / RESOURCE helpers & dedupe ===
+local ORE_MOVES = {
+	ore_guard = true, ore_heal = true, ore_shot = true,
+	resource_break = true,
+}
+local function isOreMove(id:any): boolean
+	return ORE_MOVES[string.lower(tostring(id or ""))] == true
+end
+
+local _rbSeen: {[string]: number} = {} -- key -> os.clock() timestamp
+local function vecKey(v:any): string
+	if typeof(v) ~= "Vector3" then return "0,0,0" end
+	return string.format("%d,%d,%d", math.floor(v.X+0.5), math.floor(v.Y+0.5), math.floor(v.Z+0.5))
+end
+
+
+
+-- ========= small caches / anchors =========
+local _HB = setmetatable({}, {__mode="k"}) :: {[Model]: BasePart?}
+local function holdbaseOf(model: Instance?): BasePart?
+	if not (model and model:IsA("Model")) then return nil end
+	local m = model :: Model
+	local hb = _HB[m]
+	if hb and hb.Parent then return hb end
+	local d = m:FindFirstChild("holdbase") or m:FindFirstChild("HoldBase")
+	if d and d:IsA("BasePart") then _HB[m]=d; return d end
+	for _,x in ipairs(m:GetDescendants()) do
+		if x:IsA("BasePart") and string.lower(x.Name)=="holdbase" then _HB[m]=x; return x end
+	end
+	return nil
+end
+
+local function hrpOf(model: Instance?): BasePart?
+	if not (model and model:IsA("Model")) then return nil end
+	local m = model :: Model
+	return (m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("UpperTorso") or m:FindFirstChild("Torso")) :: BasePart?
+end
+
+-- Caster anchor (marker)
+-- REPLACE-ALL: anchorForMarker (FXBusBoot.client.lua)
+local function anchorForMarker(payload: {[string]: any}): CFrame
+	local mv  = tostring(payload.moveId or ""):lower()
+	local isWork = (tostring(payload.targetKind or "") == "work")
+	local src = payload.source
+	local res = payload.resource
+	local tgt = payload.target
+
+	-- รีซอส (ore_* หรือ targetKind=work) → holdbase-first + world-align
+	if isWork or isOreMove(mv) then
+		local hb = holdbaseOf(res) or holdbaseOf(src)
+		if hb then return CFrame.new(hb.Position) end
+	end
+
+	-- คอมแบตทั่วไป: ยึดตามเดิม
+	local hb = holdbaseOf(src) or holdbaseOf(res)
+	if hb then return hb.CFrame end
+	local hrp = hrpOf(tgt); if hrp then return hrp.CFrame end
+	local pos = (typeof(payload.pos)=="Vector3") and payload.pos or Vector3.new()
+	return CFrame.new(pos)
+end
+
+-- Impact anchor (onhit) — impact point FIRST
+-- REPLACE-ALL: anchorForImpact (FXBusBoot.client.lua)
+local function anchorForImpact(payload: {[string]: any}): CFrame
+	local mv  = tostring(payload.moveId or ""):lower()
+	local isWork = (tostring(payload.targetKind or "") == "work")
+	local pos = (typeof(payload.pos)=="Vector3") and payload.pos or nil
+
+	-- เคสที่ต้องใช้ impact จริง
+	if mv == "resource_break" or mv == "ore_shot" then
+		if pos then return CFrame.new(pos) end
+	end
+
+	-- รีซอสทั่วไป → holdbase-first + world-align (กันโดน pivot)
+	if isWork or isOreMove(mv) then
+		local res = payload.resource
+		local src = payload.source
+		local hb  = holdbaseOf(res) or holdbaseOf(src)
+		if hb then return CFrame.new(hb.Position) end
+		if pos then return CFrame.new(pos) end
+		local tgt = payload.target
+		local hrp = hrpOf(tgt); if hrp then return hrp.CFrame end
+		return CFrame.new()
+	end
+
+	-- คอมแบตทั่วไป: impact point ก่อน
+	if pos then return CFrame.new(pos) end
+	local tgt = payload.target
+	local hrp = hrpOf(tgt); if hrp then return hrp.CFrame end
+	local res = payload.resource
+	local src = payload.source
+	local hb  = holdbaseOf(res) or holdbaseOf(src)
+	if hb then return hb.CFrame end
+	return CFrame.new()
+end
+
+-- ==== DEBUG (early define; must be above any caller) ====
+local DEBUG = true
+local function J(x:any)
+	local ok, s = pcall(function() return Http:JSONEncode(x) end)
+	return ok and s or tostring(x)
+end
+local function dbg(...) if DEBUG then print("[FXBUSBOOT]", ...) end end
+
+-- optional visual markers (toggle by attribute)
+local SHOW_MARKERS = (RS:GetAttribute("Fx_DebugMarkers") == true)
+local _SEQ = 0
+local function _nextSeq() _SEQ += 1; return _SEQ end
+-- ==== SAFE _qpos ====
+local function _qpos(cf: CFrame?)
+	if typeof(cf) == "CFrame" then
+		local p = cf.Position
+		return math.floor(p.X * 10 + 0.5), math.floor(p.Y * 10 + 0.5), math.floor(p.Z * 10 + 0.5)
+	elseif typeof(cf) == "Vector3" then
+		local p = cf
+		return math.floor(p.X * 10 + 0.5), math.floor(p.Y * 10 + 0.5), math.floor(p.Z * 10 + 0.5)
+	else
+		return 0, 0, 0
+	end
+end
+
+local function _mark(cf: CFrame, label: string)
+	if not SHOW_MARKERS then return end
+	local p = Instance.new("Part")
+	p.Name = "_fxdbg_"..label
+	p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery = true,false,false,false
+	p.Size, p.Transparency, p.CFrame = Vector3.new(0.2,0.2,0.2), 0.2, cf
+	p.Color = Color3.fromRGB(255, 0, 255)
+	p.Parent = Workspace
+	Debris:AddItem(p, 0.6)
+end
+
+-- ==== canonical de-dup (resource break, cross-branch) ====
+local _recentRB = {} :: {[string]: number}
+local function _rbKey(payload: {[string]: any}, cf: CFrame): string
+	local typ  = tostring(payload.type or "?"):lower()
+	local tier = tonumber(payload.tier or 1) or 1
+	local qx,qy,qz = _qpos(cf)
+	return ("RB|%s|T%d|%d,%d,%d"):format(typ, tier, qx, qy, qz)
+end
+local function _rbDedupe(payload: {[string]: any}, cf: CFrame, who: string): boolean
+	local k = _rbKey(payload, cf)
+	local now  = os.clock()
+	local last = _recentRB[k] or 0
+	_recentRB[k] = now
+	local hit = (now - last) <= 0.12 -- 120ms window
+	if hit then dbg(("✖ DEDUPE[%s] %s"):format(who, k)) end
+	return hit
+end
+
+
+-- ========= de-dup =========
+local recent = {} :: {[string]: number}
+local function keyOf(kind: string, moveId: string, cf: CFrame): string
+	local p = cf.Position
+	local qx = math.floor(p.X*10+0.5); local qy = math.floor(p.Y*10+0.5); local qz = math.floor(p.Z*10+0.5)
+	return table.concat({kind, moveId, qx, qy, qz}, "|")
+end
+local function dedupe(kind: string, moveId: string, cf: CFrame): boolean
+	local k = keyOf(kind, moveId, cf); local now = os.clock()
+	local last = recent[k] or 0; recent[k] = now
+	return (now - last) <= 0.10
+end
+
+-- ========= alias maps (สำรอง) =========
+local VFX_ALIAS = {
+	ore_heal  = { start="ore_heal_pulse",  onhit="ore_heal_pulse"  },
+	ore_guard = { start="ore_guard_pulse", onhit="ore_guard_pulse" },
+	ore_trick = { start="ore_trick_pop",   onhit="ore_trick_pop"   },
+	ore_shot  = { start="ore_shot_muzzle", onhit="ore_shot_hit"    },
+	resource_break = { onhit="resource_break" }, -- เผื่อคีย์นี้หายจาก Catalog
+}
+local SFX_ALIAS = {
+	ore_heal  = { start="ore_heal_pulse",  onhit="ore_heal_pulse"  },
+	ore_guard = { start="ore_guard_pulse", onhit="ore_guard_pulse" },
+	ore_trick = { start="ore_trick_pop",   onhit="ore_trick_pop"   },
+	ore_shot  = { start="turret_shoot",    onhit="turret_hit"      },
+	resource_break = { onhit="resource_break" },
+}
+
+
+-- ===== helpers (คงไว้ได้) =====
+local function _pickBreakKeyByType(typ: string, tier: number): string
+	typ = string.lower(tostring(typ or ""))
+	tier = tonumber(tier or 1) or 1
+	if typ == "tree" then
+		if tier >= 3 then return "resource_break_tree_t3" end
+		if tier >= 2 then return "resource_break_tree_t2" end
+		return "resource_break_tree"
+	elseif typ == "rock" then
+		if tier >= 3 then return "resource_break_rock_t3" end
+		if tier >= 2 then return "resource_break_rock_t2" end
+		return "resource_break_rock"
+	end
+	return "resource_break" -- generic fallback
+end
+
+local function _findByNameRecursive(root: Instance, name: string): Instance?
+	if not root then return nil end
+	local d = root:FindFirstChild(name)
+	if d then return d end
+	for _,x in ipairs(root:GetDescendants()) do
+		if x.Name == name then return x end
+	end
+	return nil
+end
+
+local function _firstSoundIn(node: Instance?): Sound?
+	if not node then return nil end
+	if node:IsA("Sound") then return node end
+	if node:IsA("Folder") then
+		for _,d in ipairs(node:GetDescendants()) do
+			if d:IsA("Sound") then return d end
+		end
+	end
+	return nil
+end
+
+local function _playClonedSoundAt(snd: Sound, cf: CFrame)
+	local p = Instance.new("Part")
+	p.Name = "_rb_sfx_anchor"
+	p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery = true,false,false,false
+	p.Size, p.Transparency, p.CFrame = Vector3.new(0.1,0.1,0.1), 1, cf
+	p.Parent = Workspace
+
+	local c = snd:Clone()
+	c.Parent = p
+	pcall(function()
+		c.Volume = math.max(c.Volume, 0.8)
+		c.RollOffMode = Enum.RollOffMode.Inverse
+		c.RollOffMinDistance = 6
+		c.RollOffMaxDistance = 128
+	end)
+	c:Play()
+
+	local t = (c.TimeLength and c.TimeLength > 0) and c.TimeLength or 3
+	Debris:AddItem(c, t+1); Debris:AddItem(p, t+1)
+end
+
+local function _parseTier(t:any): number
+	if typeof(t) == "number" then return t end
+	if type(t) == "string" then return tonumber(t:match("%d+")) or 1 end
+	return 1
+end
+
+-- ===== FINAL: playResourceBreakSfx (Assets/SFX เท่านั้น; แยก tree/rock แน่นอน) =====
+-- รองรับทั้ง:
+--   playResourceBreakSfx("tree", Vector3.new(...))
+--   playResourceBreakSfx(CFrame.new(...), { type="rock", ... })
+--   playResourceBreakSfx(Vector3.new(...), { resourceType="tree", ... })
+
+
+-- ======== VFX helpers =========
+-- เดิม: local function playVfxAtKey(key: string, cf: CFrame): boolean
+local function playVfxAtKey(key: string, cf: CFrame, vfxOpt: {[string]: any}?): boolean
+	-- ถ้ามี VfxRunner.playAt ให้ส่ง opts เข้าไปได้เลย (Lua รับอาร์กิวเมนต์เกินได้ ปลอดภัย)
+	if VfxRunnerOk and VfxRunner and typeof(VfxRunner.playAt)=="function" then
+		local ok,_ = pcall(function() VfxRunner.playAt(key, cf, vfxOpt) end)
+		if ok then return true end
+	end
+	-- ถ้าใช้ VfxCore: map duration -> lifetime ให้ด้วย
+	if VfxCoreOk and VfxCore and typeof(VfxCore.Play)=="function" then
+		local opts = vfxOpt or {}
+		if opts.duration and not opts.lifetime then
+			opts.lifetime = opts.duration
+		end
+		local ok,_ = pcall(function() VfxCore.Play(key, cf, opts) end)
+		if ok then return true end
+	end
+	return false
+end
+
+-- Catalog-first (VFX)
+local function tryCatalogVfx(moveId: string, step: string, cf: CFrame, payload: {[string]: any}?): (boolean, boolean)
+	-- returns (played, noFallbackFlag)
+	if not (VFXCAT_OK and VFXCAT and typeof(VFXCAT.Get)=="function") then return false, false end
+	local ok, key, opts = pcall(function() return VFXCAT.Get(moveId, step, payload) end)
+	if not ok then
+		dbg("CATERR", moveId, step)
+		return false, false
+	end
+	if type(key) == "string" and key ~= "" then
+		local vfxOpt = (type(opts)=="table" and opts.vfx) or nil
+		local played = playVfxAtKey(key, cf, vfxOpt)  -- ← ส่ง opts จากคาตาล็อกเข้าผู้เล่น
+		dbg(played and "✓CAT" or "✗CAT", "key="..tostring(key), moveId, step)
+		return played, (type(opts)=="table" and opts.noFallback == true)
+	end
+	dbg("–CAT:none", moveId, step)
+	return false, (type(opts)=="table" and opts.noFallback == true)
+end
+
+
+local function playMoveStep(moveId: string, step: string, cf: CFrame, payload: {[string]: any}?): boolean
+	-- 1) catalog-first
+	local played, noFallback = tryCatalogVfx(moveId, step, cf, payload)
+	if played then return true end
+
+	-- 2) (ออฟชัน) VfxRunner catalog ตัวใหญ่
+	if not FORCE_CATALOG_ONLY and VfxRunnerOk and VfxRunner and typeof(VfxRunner.play)=="function" then
+		local ok, ret = pcall(function()
+			return VfxRunner.play(nil, moveId, step, { pos = cf.Position, hitPos = cf.Position })
+		end)
+		if ok and (ret == true or (typeof(ret)=="number" and (ret :: number) > 0)) then
+			dbg("✓BIG", moveId, step)
+			return true
+		else
+			dbg("✗BIG", moveId, step, ok, ret)
+		end
+	end
+
+	-- 3) alias สำรอง
+	local key = (VFX_ALIAS[moveId] and VFX_ALIAS[moveId][step]) or nil
+	if key and playVfxAtKey(key, cf, nil) then
+		dbg("✱ALIAS", "key="..key, moveId, step)
+		return true
+	end
+
+	-- 4) safety spark → เล่นเฉพาะตอน “ไม่มี FXBus หลัก”
+	if (not noFallback) and ALLOW_SPARK then
+		dbg("✖SPARK", moveId, step)
+		return playVfxAtKey("icecage", cf, nil)
+	end
+
+	dbg("∅NOFALLBACK", moveId, step)
+	return false
+end
+
+
+-- ==== PATCH: Resolve caster (melee window) ====
+local Players = game:GetService("Players")
+
+local function _playerByNameLike(s: string?): Player?
+	if type(s) ~= "string" or s == "" then return nil end
+	-- รองรับ "Player1(-1)" → ตัดซ้ายวงเล็บ
+	local nameOnly = s:match("^([^%(]+)%(") or s
+	for _,plr in ipairs(Players:GetPlayers()) do
+		if string.lower(plr.Name) == string.lower(nameOnly) then
+			return plr
+		end
+	end
+	return nil
+end
+
+local function _playerFromUserIdMaybe(num: any): Player?
+	local uid = tonumber(num)
+	if uid and uid > 0 then
+		local ok, plr = pcall(function() return Players:GetPlayerByUserId(uid) end)
+		if ok and plr then return plr end
+	end
+	return nil
+end
+
+local function _characterOf(instance: Instance?): Model?
+	if not instance then return nil end
+	if instance:IsA("Model") and instance:FindFirstChild("Humanoid") then return instance end
+	local mdl = instance:FindFirstAncestorOfClass("Model")
+	if mdl and mdl:FindFirstChild("Humanoid") then return mdl end
+	return nil
+end
+
+local function ResolveCasterPlayer(payload: {[string]: any}): (Player?, Model?)
+	-- 1) userId แบบจริง
+	local plr = _playerFromUserIdMaybe(payload.fromUserId or payload.userId)
+	-- 2) ชื่อ (เช่น "Player1(-1)")
+	if not plr then plr = _playerByNameLike(payload.fromName or payload.senderName or tostring(payload.from or "")) end
+	-- 3) เผื่อ payload.source เป็น instance ใต้ตัวละคร
+	if not plr then
+		local ch = _characterOf(payload.source)
+		if ch then plr = Players:GetPlayerFromCharacter(ch) end
+	end
+	-- 4) fallback: target เป็นคนที่กำลังโดน (ไม่ควรใช้ แต่กัน null)
+	local ch = nil
+	if plr then ch = plr.Character end
+	if not ch then ch = _characterOf(payload.source) or _characterOf(payload.target) end
+	return plr, ch
+end
+
+-- === Weapon Catalog runner (play from Shared/VFX/Catalog/<cat>.lua) ===
+local function _requireWeaponCatalog(catName: string): any?
+	if type(catName) ~= "string" or catName == "" then return nil end
+	local catRoot = RS:FindFirstChild("Shared") and RS.Shared:FindFirstChild("VFX") and RS.Shared.VFX:FindFirstChild("Catalog")
+	if not (catRoot and catRoot:FindFirstChild(catName)) then return nil end
+	local ok, cfg = pcall(require, catRoot[catName])
+	if not ok or type(cfg) ~= "table" or type(cfg.moves) ~= "table" then return nil end
+	return cfg
+end
+
+local function _findPart(ch: Model?, name: string): BasePart?
+	if not ch then return nil end
+	local p = ch:FindFirstChild(name)
+	if p and p:IsA("BasePart") then return p end
+	for _,x in ipairs(ch:GetDescendants()) do
+		if x:IsA("BasePart") and x.Name == name then return x end
+	end
+	return nil
+end
+
+local function _worldCFFromAction(act: {[string]: any}, ch: Model?, cf: CFrame, payload: {[string]: any}): CFrame
+	-- 1) จุดกระแทกจาก payload ก่อนถ้ามี
+	if act.useImpactPoint and typeof(payload.pos) == "Vector3" then
+		return CFrame.new(payload.pos)
+	end
+	-- 2) จาก "from"
+	if type(act.from) == "string" and ch then
+		if act.from == "HRP" then
+			local hrp = _findPart(ch, "HumanoidRootPart") or _findPart(ch,"UpperTorso") or _findPart(ch,"Torso")
+			if hrp then cf = hrp.CFrame end
+		else
+			local p = _findPart(ch, act.from)
+			if p then cf = p.CFrame end
+		end
+	end
+	-- 3) offset
+	if typeof(act.offset) == "CFrame" then cf = cf * act.offset end
+	-- 4) snapMode (เอาแบบเบา ๆ: upright = ล้าง rotation)
+	if tostring(act.snapMode or "") == "upright" then
+		local p = cf.Position
+		cf = CFrame.new(p)
+	end
+	return cf
+end
+
+local function _playAssetAt(asset: string, cf: CFrame, opt: {[string]: any}?): boolean
+	if type(asset) ~= "string" or asset == "" then return false end
+	-- พยายามใช้ VfxRunner.playAt ก่อน
+	if VfxRunnerOk and VfxRunner and typeof(VfxRunner.playAt)=="function" then
+		local ok = pcall(function() VfxRunner.playAt(asset, cf, opt or {}) end)
+		if ok then return true end
+	end
+	-- fallback ใช้ VfxCore
+	if VfxCoreOk and VfxCore and typeof(VfxCore.Play)=="function" then
+		local o = opt and table.clone(opt) or {}
+		if o.duration and not o.lifetime then o.lifetime = o.duration end
+		local ok = pcall(function() VfxCore.Play(asset, cf, o) end)
+		if ok then return true end
+	end
+	return false
+end
+
+-- คืน true ถ้าสามารถเล่นจากคาตาล็อกได้ (จะ skip เส้นทาง registry ทันที)
+local function CatalogPlay_Melee(catName: string, moveId: string, step: string, ch: Model?, cf: CFrame, payload: {[string]: any}): boolean
+	local cfg = _requireWeaponCatalog(catName); if not cfg then return false end
+	local mv  = cfg.moves[moveId]; if type(mv) ~= "table" then return false end
+	local actions = mv[step];      if not actions then return false end
+
+	-- normalize ให้เป็น array เสมอ
+	if #actions == 0 then actions = { actions } end
+
+	local played = false
+	for _,act in ipairs(actions) do
+		if type(act)=="table" and tostring(act.type)=="spawn" then
+			local worldCF = _worldCFFromAction(act, ch, cf, payload)
+			local opt = {
+				duration      = tonumber(act.duration),
+				t             = act.t,                 -- timeline (scale/alpha/rot_dps)
+				scaleTo       = act.scaleTo,
+				scaleDuration = act.scaleDuration,
+			}
+			local ok = _playAssetAt(tostring(act.asset or ""), worldCF, opt)
+			played = played or ok
+		end
+		-- หมายเหตุ: ฝั่งผู้ชมเรา “ไม่ตาม” trail_on/off/stop เพื่อเลี่ยง state ซับซ้อน
+	end
+	if DEBUG then print("[FXBUSBOOT] ✓MELEE via catalog", catName, moveId, step, played) end
+	return played
+end
+
+
+-- ==== PATCH: Anchor for melee window ====
+local function _partByNames(m: Model?, names: {string}): BasePart?
+	if not m then return nil end
+	for _,n in ipairs(names) do
+		local p = m:FindFirstChild(n)
+		if p and p:IsA("BasePart") then return p end
+	end
+	return nil
+end
+
+local function AnchorForMeleeWindow(payload: {[string]: any}): CFrame
+	local _, ch = ResolveCasterPlayer(payload)
+	if ch then
+		-- มือขวา → มือซ้าย → HRP → UpperTorso
+		local hand = _partByNames(ch, {"RightHand","HandRight","Right Arm","LeftHand","HandLeft","Left Arm"})
+		if hand then return hand.CFrame end
+		local hrp = _partByNames(ch, {"HumanoidRootPart","UpperTorso","Torso"})
+		if hrp then return hrp.CFrame end
+	end
+	-- เผื่อ payload ส่ง pos มา
+	local pos = (typeof(payload.pos)=="Vector3" and payload.pos) or Vector3.new()
+	return CFrame.new(pos)
+end
+
+
+-- ==== PATCH: Dedupe for melee window ====
+local _recentMelee = {} :: {[string]: number}
+local function _meleeKey(payload: {[string]: any}, casterKey: string, mv: string, step: string): string
+	local idx = tostring(payload.idx or payload.index or "?")
+	return table.concat({"MELEE", casterKey, mv, step, idx}, "|")
+end
+
+local function DedupeMelee(payload: {[string]: any}, casterKey: string, mv: string, step: string, windowSec: number?): boolean
+	local k = _meleeKey(payload, casterKey, mv, step)
+	local now = os.clock()
+	local last = _recentMelee[k] or 0
+	_recentMelee[k] = now
+	return (now - last) <= (windowSec or 0.10) -- 100ms
+end
+
+-- REPLACE-ALL: HandleMeleeWindow (with multi-hit step fallback & no pos/worldCF)
+local function HandleMeleeWindow(payload: {[string]: any})
+	-- ===== fields =====
+	local mv   = tostring(payload.move or payload.moveId or "atk1")
+	local step = tostring(payload.step or "hit_on")
+	local cat  = tostring(payload.vfxcatalog or payload.catalog or "")
+
+	local Players = game:GetService("Players")
+	local RS      = game:GetService("ReplicatedStorage")
+	local me      = Players.LocalPlayer
+
+	-- ===== ใครเป็นคนตี =====
+	local plr, ch = ResolveCasterPlayer(payload)
+
+	-- ===== ข้าม event ของตัวเอง (กันเล่นซ้ำบนเครื่องเรา) =====
+	do
+		local fromUid = tonumber(payload.fromUserId)
+		if me and ((plr and plr == me)
+			or (fromUid and fromUid == me.UserId)
+			or (type(payload.fromName)=="string" and payload.fromName:match("^"..me.Name))) then
+			if DEBUG then print("[FXBUSBOOT] ⏭ skip self melee", mv, step, cat) end
+			return
+		end
+	end
+
+	-- ===== กันซ้ำตามหน้าต่าง (100ms) =====
+	do
+		local casterKey
+		if plr then
+			casterKey = "u"..tostring(plr.UserId)
+		elseif ch then
+			local eid = ch:GetAttribute("EntityId") or ch:GetAttribute("NetId") or ch:GetAttribute("Uid")
+			casterKey = "c:"..tostring(eid or ch:GetFullName())
+		else
+			casterKey = tostring(payload.from or payload.fromName or "?")
+		end
+		if DedupeMelee(payload, casterKey, mv, step, 0.10) then return end
+	end
+
+	-- ===== helper: มีสเต็ปนี้ในคาตาล็อกไหม =====
+	local function CatalogHasStep(catName: string, moveId: string, stepName: string): boolean
+		if catName == "" then return false end
+		local root = RS:WaitForChild("Shared"):WaitForChild("VFX"):WaitForChild("Catalog")
+		local mod  = root:FindFirstChild(catName)
+		if not (mod and mod:IsA("ModuleScript")) then return false end
+		local ok, cfg = pcall(function() return require(mod) end)
+		if not ok or type(cfg)~="table" then return false end
+		local moves = rawget(cfg, "moves")
+		local entry = moves and rawget(moves, moveId)
+		local actions = entry and rawget(entry, stepName)
+		return type(actions)=="table" and #actions>0
+	end
+
+	-- ===== เลือกสเต็ปให้ถูก (รองรับ hit1_on/hit2_on → fallback) =====
+	local function NormalizeWindowStep(catName: string, moveId: string, stepName: string): string
+		if CatalogHasStep(catName, moveId, stepName) then return stepName end
+		if stepName:match("^hit%d+_on$") and CatalogHasStep(catName, moveId, "hit_on") then
+			return "hit_on"
+		end
+		if CatalogHasStep(catName, moveId, "onhit") then
+			return "onhit"
+		end
+		return stepName
+	end
+	local useStep = NormalizeWindowStep(cat, mv, step)
+
+	-- ===== หา Tool จริงของผู้ตี หรือทำ ghost tool ตามคาตาล็อก =====
+	local function FindToolForCatalog(model: Model?, catName: string): Tool?
+		if not (model and catName ~= "") then return nil end
+		for _,x in ipairs(model:GetChildren()) do
+			if x:IsA("Tool") then
+				local vcat = tostring(x:GetAttribute("VfxCatalog") or x:GetAttribute("vfxcatalog") or "")
+				if x.Name:lower()==catName:lower() or vcat:lower()==catName:lower() then
+					return x
+				end
+			end
+		end
+		return nil
+	end
+	local toolInst: Tool? = FindToolForCatalog(ch, cat)
+	if (not toolInst) and cat ~= "" then
+		toolInst = Instance.new("Tool")
+		toolInst.Name = "_GhostTool_"..cat
+		toolInst:SetAttribute("VfxCatalog", cat)
+	end
+
+	-- ===== ให้คาตาล็อกจัดวางเองทั้งหมด (ไม่ส่ง pos/hitPos/worldCF) =====
+	-- noFallback=true กันการยัด fallback (เช่น slash1/2/3/4)
+	if VfxRunnerOk and VfxRunner and typeof(VfxRunner.play)=="function" then
+		local ok, err = pcall(function()
+			return VfxRunner.play(toolInst, mv, useStep, {
+				catalog    = (cat ~= "" and cat or nil),
+				charModel  = ch,
+				noFallback = true,
+				via        = "bus-melee",
+			})
+		end)
+		-- ถือว่า ok = สำเร็จ (ไม่ตีความ ret == nil ว่าล้มเหลว เพื่อกัน debug หลอก)
+		if ok then
+			if DEBUG then print("[FXBUSBOOT] ✓MELEE", mv, useStep, cat, toolInst and toolInst.Name or "(ghost)") end
+			return
+		end
+		if DEBUG then warn("[FXBUSBOOT] ✗MELEE pcall error", mv, useStep, cat, err) end
+	end
+
+	-- ไม่มี runner → เงียบ (ไม่ fallback อื่น เพื่อไม่ให้ภาพซ้ำ)
+	if DEBUG then warn("[FXBUSBOOT] ∅MELEE no runner") end
+end
+
+
+-- ========= SFX helpers =========
+local function playSfxAssetFrom(folder: Instance, name: string, cf: CFrame): boolean
+	local src = folder and folder:FindFirstChild(name)
+	if not (src and src:IsA("Sound")) then return false end
+	local p = Instance.new("Part")
+	p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery = true,false,false,false
+	p.Size, p.Transparency, p.CFrame = Vector3.new(0.1,0.1,0.1), 1, cf
+	p.Parent = Workspace
+	local s = src:Clone(); s.Parent = p; s:Play()
+	local t = (s.TimeLength and s.TimeLength > 0) and s.TimeLength or 2
+	Debris:AddItem(s, t+1); Debris:AddItem(p, t+1)
+	return true
+end
+
+-- ===== direct SFX for resource_break (tree/rock) =====
+-- ===== direct SFX for resource_break (tree/rock) — ASSETS ONLY, NO CATALOG =====
+
+local function _playAssetSfxAt(folder: Instance, name: string, cf: CFrame): boolean
+	if not (folder and folder:IsA("Folder")) then return false end
+	local src = folder:FindFirstChild(name)
+	if not (src and src:IsA("Sound")) then return false end
+
+	local p = Instance.new("Part")
+	p.Name = "_rb_sfx_anchor"
+	p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery = true, false, false, false
+	p.Size, p.Transparency, p.CFrame = Vector3.new(0.1,0.1,0.1), 1, cf
+	p.Parent = Workspace
+
+	local c = (src :: Sound):Clone()
+	c.Parent = p
+	c:Play()
+
+	local t = (c.TimeLength and c.TimeLength > 0) and c.TimeLength or 2
+	Debris:AddItem(c, t+1); Debris:AddItem(p, t+1)
+	return true
+end
+
+-- ลบฟังก์ชัน playResourceBreakSfx เดิมทั้งหมด แล้ววางอันนี้แทน
+
+local function _findByNameRecursive(root: Instance, name: string): Instance?
+	if not root then return nil end
+	local d = root:FindFirstChild(name)
+	if d then return d end
+	for _,x in ipairs(root:GetDescendants()) do
+		if x.Name == name then return x end
+	end
+	return nil
+end
+
+local function _firstSoundIn(node: Instance?): Sound?
+	if not node then return nil end
+	if node:IsA("Sound") then return node end
+	if node:IsA("Folder") then
+		for _,d in ipairs(node:GetDescendants()) do
+			if d:IsA("Sound") then return d end
+		end
+	end
+	return nil
+end
+
+local function _playClonedSoundAt(snd: Sound, cf: CFrame)
+	local p = Instance.new("Part")
+	p.Name = "_rb_sfx_anchor"
+	p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery = true,false,false,false
+	p.Size, p.Transparency, p.CFrame = Vector3.new(0.1,0.1,0.1), 1, cf
+	p.Parent = Workspace
+
+	local c = snd:Clone()
+	c.Parent = p
+	-- ทำให้ได้ยินชัด
+	pcall(function()
+		c.Volume = math.max(c.Volume, 0.8)
+		c.RollOffMode = Enum.RollOffMode.Inverse
+		c.RollOffMinDistance = 6
+		c.RollOffMaxDistance = 128
+	end)
+	c:Play()
+
+	local t = (c.TimeLength and c.TimeLength > 0) and c.TimeLength or 3
+	Debris:AddItem(c, t+1); Debris:AddItem(p, t+1)
+end
+
+
+-- Catalog-first (SFX) หลัง Router
+local function tryCatalogSfx(moveId: string, step: string, cf: CFrame, payload: {[string]: any}?): boolean
+	if not (SFXCAT_OK and SFXCAT and typeof(SFXCAT.Get)=="function") then return false end
+	local ok, soundName = pcall(function() return SFXCAT.Get(moveId, step, payload) end)
+	if not ok or type(soundName) ~= "string" or soundName == "" then return false end
+
+	local snd = findSfxByName(soundName) -- ← ใช้ finder ใหม่ (Assets-first + safe cache)
+	if not snd then return false end
+
+	local p = Instance.new("Part")
+	p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery = true,false,false,false
+	p.Size, p.Transparency, p.CFrame = Vector3.new(0.1,0.1,0.1), 1, cf
+	p.Parent = Workspace
+	local c = snd:Clone(); c.Parent = p; c:Play()
+	local t = (c.TimeLength and c.TimeLength>0) and c.TimeLength or 2
+	Debris:AddItem(c, t+1); Debris:AddItem(p, t+1)
+	if DEBUG then print("[FXBUSBOOT] ✓CAT.SFX", soundName, moveId, step) end
+	return true
+end
+
+
+-- หาและเล่น SFX ตามชื่อ จาก Shared/SFX หรือ Assets/SFX (recursive)
+local function _playSfxKeyAnyRoot(name: string, cf: CFrame): boolean
+	if type(name) ~= "string" or name == "" then return false end
+	local snd = findSfxByName(name)
+	if not snd then return false end
+	local p = Instance.new("Part")
+	p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery = true,false,false,false
+	p.Size, p.Transparency, p.CFrame = Vector3.new(0.1,0.1,0.1), 1, cf
+	p.Parent = Workspace
+	local c = snd:Clone(); c.Parent = p; c:Play()
+	local t = (c.TimeLength and c.TimeLength>0) and c.TimeLength or 2
+	Debris:AddItem(c, t+1); Debris:AddItem(p, t+1)
+	if DEBUG then print("[RB] ✓PLAY", name) end
+	return true
+end
+
+
+-- onhit เท่านั้น → Router → Catalog → Alias → Shared/Assets
+local function playOnHitSfx(cf: CFrame, moveId: string, step: string, payload: {[string]: any}?): ()
+	-- 1) Catalog ก่อนเสมอ
+	if tryCatalogSfx(moveId, step, cf, payload) then return end
+	-- 2) ถ้าไม่ force ค่อยลอง Router
+	if not FORCE_CATALOG_ONLY and SfxRouterOk and SfxRouter and typeof(SfxRouter.PlayOnHit)=="function" then
+		local ok, did = pcall(function()
+			return SfxRouter.PlayOnHit({ tool=nil, moveId=moveId, character=nil, humanoid=nil, clipSpeed=1, atkSpeed=1 }, cf)
+		end)
+		if ok and did == true then return end
+	end
+	-- 3) alias สำรอง (เป็นทางสุดท้าย)
+	-- (จะคงไว้ก็ได้ หรือถ้าอยากคุมเข้มให้ลบทิ้ง)
+end
+-- marker (start/end/hit_on...) → Router (ชื่อ step) → Catalog → Alias
+local function playMarkerSfx(cf: CFrame, moveId: string, step: string, payload: {[string]: any}?): ()
+	-- 1) Catalog ก่อน
+	if tryCatalogSfx(moveId, step, cf, payload) then return end
+	-- 2) Router (ถ้าไม่ force)
+	if not FORCE_CATALOG_ONLY and SfxRouterOk and SfxRouter then
+		if typeof(SfxRouter.PlayNamed)=="function" then
+			local ok, did = pcall(function() return SfxRouter.PlayNamed({ tool=nil, moveId=moveId }, step) end)
+			if ok and did == true then return end
+		elseif typeof(SfxRouter.PlayMarker)=="function" then
+			pcall(function() SfxRouter.PlayMarker({ tool=nil, moveId=moveId }, step) end)
+			return
+		end
+	end
+	-- 3) alias สำรอง (ลบทิ้งได้ถ้าอยากให้คาตาล็อกคุม 100%)
+end
+
+-- ===== direct SFX for resource_break (tree/rock) =====
+local function parseTier(t:any): number
+	if typeof(t) == "number" then return t end
+	if type(t) == "string" then
+		local n = tonumber(t:match("%d+"))
+		return n or 1
+	end
+	return 1
+end
+
+Remote.OnClientEvent:Connect(function(payload: any)
+	if type(payload) ~= "table" then return end
+
+	local kind = tostring(payload.kind or "")
+	local move = tostring(payload.moveId or "")
+
+	-- ✅ เคส melee ต้องมาก่อน เพื่อไม่ให้ไปติด log/anchor ที่ไม่เกี่ยว
+	if kind == "melee" then
+		HandleMeleeWindow(payload)
+		return
+	end
+
+	-- คำนวณ anchor ก่อน แล้วค่อย log (กัน qpos=nil)
+	local cf = (kind == "marker") and anchorForMarker(payload) or anchorForImpact(payload)
+
+	if DEBUG then
+		local sx = _nextSeq()
+		local qx,qy,qz = _qpos(cf)
+		dbg(("RX#%d kind=%s move=%s qpos=%d,%d,%d type=%s tier=%s"):format(
+			sx, kind, move, qx, qy, qz, tostring(payload.type or ""), tostring(payload.tier or "")))
+	end
+
+	-- ===== A) explicit resource_break =====
+	if kind == "resource_break" then
+		if _rbDedupe(payload, cf, "RB.KIND") then return end
+		_mark(cf, "RB:KIND")
+		_rbSeen[vecKey(payload.qpos or payload.pos or cf.Position)] = os.clock()
+
+		local playedCat, noFB = tryCatalogVfx("resource_break", "onhit", cf, payload)
+		if not playedCat and not noFB then
+			local typ  = tostring(payload.type or ""):lower()
+			local tier = _parseTier(payload.tier)
+			local forced = _pickBreakKeyByType(typ, tier)
+			_ = playVfxAtKey(forced, cf, nil)
+		end
+		playResourceBreakSfx(cf, payload)
+		return
+	end
+
+	-- ===== B) onhit (รวม resource_break แบบ onhit) =====
+	if kind == "onhit" then
+		local mv = string.lower(tostring(payload.moveId or "atk1"))
+
+		if mv == "ore_shot" then
+			local id = tostring(payload.shotId or "")
+			if id ~= "" then _killProjectile(id, (typeof(payload.pos)=="Vector3" and payload.pos) or nil) end
+		end
+
+		if isOreMove(mv) then
+			if mv == "resource_break" then
+				local k = vecKey(payload.qpos or payload.pos or cf.Position)
+				local t = _rbSeen[k]
+				if t and (os.clock() - t) < 0.25 then return end
+			end
+			playOnHitSfx(cf, mv, "onhit", payload) -- SFX ก่อน แต่ไม่ return
+		end
+
+		if mv == "resource_break" then
+			if _rbDedupe(payload, cf, "RB.ONHIT") then return end
+			_mark(cf, "RB:ONHIT")
+			local playedCat, noFB = tryCatalogVfx("resource_break", "onhit", cf, payload)
+			if not playedCat and not noFB then
+				local typ  = tostring(payload.type or ""):lower()
+				local tier = _parseTier(payload.tier)
+				local forced = _pickBreakKeyByType(typ, tier)
+				_ = playVfxAtKey(forced, cf, nil)
+			end
+			return
+		end
+
+		if not dedupe(kind, mv, cf) then
+			_mark(cf, "HIT:"..mv)
+			_ = playMoveStep(mv, "onhit", cf, payload)
+			playOnHitSfx(cf, mv, "onhit", payload)
+		end
+		return
+	end
+
+	-- ===== C) marker =====
+	if kind == "marker" then
+		local mv   = (move ~= "" and move) or "ore_trick"
+		local step = tostring(payload.step or "start")
+
+		if mv == "ore_shot" and step == "projectile" then
+			_spawnClientProjectileFromCatalog("ore_shot", payload)
+		end
+
+		if not dedupe(kind, (mv..":"..step), cf) then
+			_mark(cf, "MRK:"..mv..":"..step)
+			_ = playMoveStep(mv, step, cf, payload)
+			playMarkerSfx(cf, mv, step, payload)
+		end
+		return
+	end
+end)
+
+
+if hasMain then dbg("FXBus main module present; fallback listener active with dedupe.")
+else dbg("Fallback FXBus listener active.") end
