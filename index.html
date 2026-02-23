@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="th">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ocean Moon Seafood | โรงงานแปรรูปอาหารทะเล</title>
+    <meta name="description"
+        content="Ocean Moon Seafood โรงงานแปรรูปอาหารทะเลชั้นนำ ผลิตและจำหน่ายอาหารทะเลคุณภาพสูง ปลาหมึก หอย กุ้ง พร้อมบริการ OEM">
+
+    <!-- Google Fonts: Prompt (ภาษาไทย) + Inter (ภาษาอังกฤษ) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Prompt:wght@300;400;500;600;700&display=swap"
+        rel="stylesheet">
+
+    <link rel="stylesheet" href="styles.css?v=2">
+</head>
+
+<body>
+
+    <!-- ============================================= -->
+    <!-- ส่วนที่ 0: HEADER / แถบนำทาง (Sticky Header) -->
+    <!-- ============================================= -->
+    <header class="header" id="header">
+        <div class="header-container">
+            <a href="index.html" class="logo">
+                <span class="logo-icon">🌊</span>
+                <span class="logo-text">OCEAN MOON<span class="logo-sub">SEAFOOD</span></span>
+            </a>
+            <nav class="nav" id="nav">
+                <ul class="nav-list">
+                    <li><a href="index.html" class="nav-link active">Home</a></li>
+                    <li class="nav-dropdown">
+                        <span class="nav-link dropdown-toggle">Product&amp;Service</span>
+                        <ul class="dropdown-menu">
+                            <li><a href="products.html" class="dropdown-link">Product</a></li>
+                            <li><a href="services.html" class="dropdown-link">Service</a></li>
+                        </ul>
+                    </li>
+                    <li><a href="knowledge.html" class="nav-link">Knowledge</a></li>
+                    <li><a href="about.html" class="nav-link">About Us</a></li>
+                    <li><a href="contact.html" class="nav-link">Contact</a></li>
+                </ul>
+            </nav>
+            <button class="hamburger" id="hamburger" aria-label="เปิดเมนู">
+                <span></span><span></span><span></span>
+            </button>
+        </div>
+    </header>
+
+    <!-- ============================================= -->
+    <!-- ส่วนที่ 1: HERO SECTION                        -->
+    <!-- ============================================= -->
+    <section class="hero" id="home">
+        <div class="hero-bg"></div>
+
+        <!-- Animated decorative banners -->
+        <div class="hero-banner banner-sweep-left"></div>
+        <div class="hero-banner banner-sweep-right"></div>
+        <div class="hero-banner banner-sweep-left-2"></div>
+        <div class="hero-banner banner-sweep-right-2"></div>
+        <div class="hero-banner banner-sweep-left-3"></div>
+
+        <div class="hero-split">
+            <!-- ด้านซ้าย: รูปภาพใหญ่ placeholder #1 -->
+            <div class="hero-image-wrapper animate-slide-right">
+                <div class="hero-image-placeholder" aria-label="รูปภาพที่ 1 - ภาพหลักโรงงาน">
+                    <span class="placeholder-number">1</span>
+                </div>
+            </div>
+
+            <!-- ด้านขวา: ข้อความ + cert circles ด้านล่าง -->
+            <div class="hero-right-col animate-slide-left">
+                <div class="hero-text-box">
+                    <p class="hero-label">PREMIUM SEAFOOD PROCESSING</p>
+                    <h1 class="hero-title">OCEAN MOON</h1>
+                    <p class="hero-title-sub">S E A F O O D</p>
+                    <p class="hero-desc">โรงงานแปรรูปอาหารทะเลชั้นนำ มาตรฐาน
+                        GMP/HACCP<br>ผลิตและจำหน่ายอาหารทะเลคุณภาพสูงสู่ตลาดโลก</p>
+                    <div class="hero-buttons">
+                        <a href="products.html" class="btn btn-primary">ดูสินค้าของเรา</a>
+                        <a href="about.html" class="btn btn-glass">เกี่ยวกับเรา</a>
+                    </div>
+                </div>
+
+                <!-- วงกลมมาตรฐาน ใต้กล่องข้อความ ชิดขวา -->
+                <div class="hero-certifications">
+                    <div class="cert-circle animate-pop" aria-label="มาตรฐานที่ 1">
+                        <div class="cert-placeholder">
+                            <span class="cert-number">C1</span>
+                            <span class="cert-label">HACCP</span>
+                        </div>
+                    </div>
+                    <div class="cert-circle animate-pop" aria-label="มาตรฐานที่ 2">
+                        <div class="cert-placeholder">
+                            <span class="cert-number">C2</span>
+                            <span class="cert-label">GMP</span>
+                        </div>
+                    </div>
+                    <div class="cert-circle animate-pop" aria-label="มาตรฐานที่ 3">
+                        <div class="cert-placeholder">
+                            <span class="cert-number">C3</span>
+                            <span class="cert-label">BRC</span>
+                        </div>
+                    </div>
+                    <div class="cert-circle animate-pop" aria-label="มาตรฐานที่ 4">
+                        <div class="cert-placeholder">
+                            <span class="cert-number">C4</span>
+                            <span class="cert-label">IFS</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ============================================= -->
+    <!-- SWEEP LINES — เส้นโฉบเฉี่ยวจากซ้ายไปขวา        -->
+    <!-- ============================================= -->
+    <div class="sweep-lines-section">
+        <div class="section-banner sweep-in-left"></div>
+        <div class="section-banner sweep-in-right"></div>
+    </div>
+
+    <!-- ============================================= -->
+    <!-- ส่วนที่ 2: QUICK-NAV CARDS (4 การ์ด)          -->
+    <!-- ============================================= -->
+    <section class="quick-nav">
+        <div class="container">
+            <div class="quick-nav-grid">
+                <a href="products.html" class="qnav-card animate-on-scroll">
+                    <div class="qnav-img-wrap">
+                        <div class="image-placeholder" aria-label="Product">
+                            <span class="placeholder-number" style="font-size:36px;">P</span>
+                        </div>
+                    </div>
+                    <span class="qnav-label">Product</span>
+                </a>
+                <a href="services.html" class="qnav-card animate-on-scroll">
+                    <div class="qnav-img-wrap">
+                        <div class="image-placeholder" aria-label="Service">
+                            <span class="placeholder-number" style="font-size:36px;">S</span>
+                        </div>
+                    </div>
+                    <span class="qnav-label">Service</span>
+                </a>
+                <a href="about.html" class="qnav-card animate-on-scroll">
+                    <div class="qnav-img-wrap">
+                        <div class="image-placeholder" aria-label="Company">
+                            <span class="placeholder-number" style="font-size:36px;">C</span>
+                        </div>
+                    </div>
+                    <span class="qnav-label">Company</span>
+                </a>
+                <a href="knowledge.html" class="qnav-card animate-on-scroll">
+                    <div class="qnav-img-wrap">
+                        <div class="image-placeholder" aria-label="Knowledge">
+                            <span class="placeholder-number" style="font-size:36px;">K</span>
+                        </div>
+                    </div>
+                    <span class="qnav-label">Knowledge</span>
+                </a>
+            </div>
+        </div>
+    </section>
+
+    <!-- ============================================= -->
+    <!-- ส่วนที่ 3: OUR PRODUCTS / สินค้าของเรา         -->
+    <!-- ============================================= -->
+    <section class="products" id="products">
+        <div class="section-banner sweep-in-right-alt"></div>
+
+        <div class="container">
+            <div class="section-header animate-on-scroll">
+                <div class="label-line">
+                    <span class="line-left"></span>
+                    <span class="section-label">OUR PRODUCTS</span>
+                    <span class="line-right"></span>
+                </div>
+                <h2 class="section-title">สินค้าของเรา</h2>
+            </div>
+
+            <div class="products-circles-grid animate-on-scroll">
+                <!-- สินค้า 1 -->
+                <div class="product-circle-item">
+                    <div class="product-circle-img">
+                        <div class="circle-placeholder" aria-label="รูปภาพที่ 5">
+                            <span class="placeholder-number">5</span>
+                        </div>
+                    </div>
+                    <span class="product-circle-label">ปลาหมึกแปรรูป</span>
+                </div>
+                <!-- สินค้า 2 -->
+                <div class="product-circle-item">
+                    <div class="product-circle-img">
+                        <div class="circle-placeholder" aria-label="รูปภาพที่ 6">
+                            <span class="placeholder-number">6</span>
+                        </div>
+                    </div>
+                    <span class="product-circle-label">หอยแปรรูป</span>
+                </div>
+                <!-- สินค้า 3 -->
+                <div class="product-circle-item">
+                    <div class="product-circle-img">
+                        <div class="circle-placeholder" aria-label="รูปภาพที่ 7">
+                            <span class="placeholder-number">7</span>
+                        </div>
+                    </div>
+                    <span class="product-circle-label">กุ้งแปรรูป</span>
+                </div>
+                <!-- สินค้า 4 -->
+                <div class="product-circle-item">
+                    <div class="product-circle-img">
+                        <div class="circle-placeholder" aria-label="รูปภาพที่ 8">
+                            <span class="placeholder-number">8</span>
+                        </div>
+                    </div>
+                    <span class="product-circle-label">ปลาแปรรูป</span>
+                </div>
+                <!-- สินค้า 5 -->
+                <div class="product-circle-item">
+                    <div class="product-circle-img">
+                        <div class="circle-placeholder" aria-label="รูปภาพที่ 9">
+                            <span class="placeholder-number">9</span>
+                        </div>
+                    </div>
+                    <span class="product-circle-label">อาหารทะเลแช่แข็ง</span>
+                </div>
+                <!-- สินค้า 6 -->
+                <div class="product-circle-item">
+                    <div class="product-circle-img">
+                        <div class="circle-placeholder" aria-label="รูปภาพที่ 10">
+                            <span class="placeholder-number">10</span>
+                        </div>
+                    </div>
+                    <span class="product-circle-label">อาหารทะเลปรุงรส</span>
+                </div>
+                <!-- สินค้า 7 -->
+                <div class="product-circle-item">
+                    <div class="product-circle-img">
+                        <div class="circle-placeholder" aria-label="รูปภาพที่ 11">
+                            <span class="placeholder-number">11</span>
+                        </div>
+                    </div>
+                    <span class="product-circle-label">สินค้า OEM</span>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ============================================= -->
+    <!-- ส่วนที่ 4: OUR VISION / กลยุทธ์               -->
+    <!-- ============================================= -->
+    <section class="strategic">
+        <div class="strategic-bg">
+            <div class="strategic-placeholder" aria-label="รูปภาพที่ 9">
+                <span class="placeholder-number">9</span>
+            </div>
+        </div>
+        <div class="strategic-overlay"></div>
+
+        <!-- Animated sweep lines -->
+        <div class="strategic-sweep sweep-1"></div>
+        <div class="strategic-sweep sweep-2"></div>
+
+        <div class="container">
+            <div class="strategic-content animate-on-scroll">
+                <p class="section-label light">OUR VISION</p>
+                <h2 class="strategic-title">การลงทุนเชิงกลยุทธ์<br>เพื่อเป้าหมายการเติบโต</h2>
+                <p class="strategic-text">
+                    เรามุ่งมั่นพัฒนาธุรกิจอาหารทะเลตลอดห่วงโซ่คุณค่า ตั้งแต่ต้นน้ำ กลางน้ำ ไปจนถึงปลายน้ำ
+                </p>
+                <div class="strategic-stats">
+                    <div class="strat-stat">
+                        <span class="strat-num">500+</span>
+                        <span class="strat-label">ตันต่อเดือน</span>
+                    </div>
+                    <div class="strat-stat">
+                        <span class="strat-num">100+</span>
+                        <span class="strat-label">ผลิตภัณฑ์</span>
+                    </div>
+                    <div class="strat-stat">
+                        <span class="strat-num">200+</span>
+                        <span class="strat-label">พนักงาน</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ============================================= -->
+    <!-- ส่วนที่ 5: COMPANY ACTIVITIES / กิจกรรมบริษัท  -->
+    <!-- ============================================= -->
+    <section class="activities">
+        <div class="container">
+            <div class="section-header animate-on-scroll">
+                <div class="label-line">
+                    <span class="line-left"></span>
+                    <span class="section-label">COMPANY ACTIVITIES</span>
+                    <span class="line-right"></span>
+                </div>
+                <h2 class="section-title">กิจกรรมบริษัท</h2>
+            </div>
+
+            <!-- Sweep lines -->
+            <div class="section-banner sweep-in-left"></div>
+            <div class="section-banner sweep-in-right"></div>
+
+            <!-- Train Layout -->
+            <div class="train-container animate-on-scroll">
+                <!-- หัวรถไฟ -->
+                <div class="train-head">
+                    <span class="train-head-label">Activity</span>
+                    <span class="train-head-sub">กิจกรรม<br>บริษัท</span>
+                </div>
+                <!-- ตู้รถไฟ -->
+                <div class="train-body">
+                    <div class="train-car">
+                        <div class="train-car-img">
+                            <div class="image-placeholder" aria-label="รูปภาพที่ 13">
+                                <span class="placeholder-number">13</span>
+                            </div>
+                        </div>
+                        <div class="train-car-info">
+                            <span class="activity-date">15 ก.พ. 2569</span>
+                            <h4>งานแสดงสินค้า</h4>
+                        </div>
+                    </div>
+                    <div class="train-car">
+                        <div class="train-car-img">
+                            <div class="image-placeholder" aria-label="รูปภาพที่ 14">
+                                <span class="placeholder-number">14</span>
+                            </div>
+                        </div>
+                        <div class="train-car-info">
+                            <span class="activity-date">10 ม.ค. 2569</span>
+                            <h4>CSR ปล่อยพันธุ์สัตว์น้ำ</h4>
+                        </div>
+                    </div>
+                    <div class="train-car">
+                        <div class="train-car-img">
+                            <div class="image-placeholder" aria-label="รูปภาพที่ 15">
+                                <span class="placeholder-number">15</span>
+                            </div>
+                        </div>
+                        <div class="train-car-info">
+                            <span class="activity-date">25 ธ.ค. 2568</span>
+                            <h4>งานเลี้ยงปีใหม่</h4>
+                        </div>
+                    </div>
+                    <div class="train-car">
+                        <div class="train-car-img">
+                            <div class="image-placeholder" aria-label="รูปภาพที่ 16">
+                                <span class="placeholder-number">16</span>
+                            </div>
+                        </div>
+                        <div class="train-car-info">
+                            <span class="activity-date">20 พ.ย. 2568</span>
+                            <h4>รางวัลโรงงานดีเด่น</h4>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ============================================= -->
+    <!-- FOOTER                                         -->
+    <!-- ============================================= -->
+    <footer class="site-footer">
+        <div class="container">
+            <div class="footer-top">
+                <div class="footer-brand">
+                    <a href="index.html" class="footer-logo">
+                        <span class="logo-icon">🌊</span>
+                        <span class="logo-text">OCEAN MOON <span class="logo-sub">SEAFOOD</span></span>
+                    </a>
+                    <p class="footer-desc">โรงงานแปรรูปอาหารทะเลชั้นนำ มาตรฐาน GMP/HACCP</p>
+                </div>
+                <div class="footer-contact">
+                    <h4>ติดต่อเรา</h4>
+                    <ul>
+                        <li>📍 123 ถ.สุขุมวิท อ.ศรีราชา จ.ชลบุรี</li>
+                        <li>📞 038-XXX-XXX</li>
+                        <li>✉️ info@oceanmoonseafood.com</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="footer-social">
+                <a href="#" class="social-btn social-facebook" aria-label="Facebook" target="_blank" rel="noopener">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                        <path
+                            d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z" />
+                    </svg>
+                </a>
+                <a href="#" class="social-btn social-instagram" aria-label="Instagram" target="_blank" rel="noopener">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                        <path
+                            d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zM12 0C8.741 0 8.333.014 7.053.072 2.695.272.273 2.69.073 7.052.014 8.333 0 8.741 0 12c0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98C8.333 23.986 8.741 24 12 24c3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98C15.668.014 15.259 0 12 0zm0 5.838a6.162 6.162 0 100 12.324 6.162 6.162 0 000-12.324zM12 16a4 4 0 110-8 4 4 0 010 8zm6.406-11.845a1.44 1.44 0 100 2.881 1.44 1.44 0 000-2.881z" />
+                    </svg>
+                </a>
+                <a href="#" class="social-btn social-youtube" aria-label="YouTube" target="_blank" rel="noopener">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                        <path
+                            d="M23.498 6.186a3.016 3.016 0 00-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 00.502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 002.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 002.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
+                    </svg>
+                </a>
+                <a href="#" class="social-btn social-line" aria-label="LINE" target="_blank" rel="noopener">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                        <path
+                            d="M19.365 9.863c.349 0 .63.285.63.631 0 .345-.281.63-.63.63H17.61v1.125h1.755c.349 0 .63.283.63.63 0 .344-.281.629-.63.629h-2.386c-.345 0-.627-.285-.627-.629V8.108c0-.345.282-.63.627-.63h2.386c.349 0 .63.285.63.63 0 .349-.281.63-.63.63H17.61v1.125h1.755zm-3.855 3.016c0 .27-.174.51-.432.596-.064.021-.133.031-.199.031-.211 0-.391-.09-.51-.25l-2.443-3.317v2.94c0 .344-.279.629-.631.629-.346 0-.626-.285-.626-.629V8.108c0-.27.173-.51.43-.595.06-.023.136-.033.194-.033.195 0 .375.104.495.254l2.462 3.33V8.108c0-.345.282-.63.63-.63.345 0 .63.285.63.63v4.771zm-5.741 0c0 .344-.282.629-.631.629-.345 0-.627-.285-.627-.629V8.108c0-.345.282-.63.627-.63.349 0 .631.285.631.63v4.771zm-2.466.629H4.917c-.345 0-.63-.285-.63-.629V8.108c0-.345.285-.63.63-.63.348 0 .63.285.63.63v4.141h1.756c.348 0 .629.283.629.63 0 .344-.282.629-.629.629M24 10.314C24 4.943 18.615.572 12 .572S0 4.943 0 10.314c0 4.811 4.27 8.842 10.035 9.608.391.082.923.258 1.058.59.12.301.079.766.038 1.08l-.164 1.02c-.045.301-.24 1.186 1.049.645 1.291-.539 6.916-4.078 9.436-6.975C23.176 14.393 24 12.458 24 10.314" />
+                    </svg>
+                </a>
+                <a href="#" class="social-btn social-tiktok" aria-label="TikTok" target="_blank" rel="noopener">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                        <path
+                            d="M12.525.02c1.31-.02 2.61-.01 3.91-.02.08 1.53.63 3.09 1.75 4.17 1.12 1.11 2.7 1.62 4.24 1.79v4.03c-1.44-.05-2.89-.35-4.2-.97-.57-.26-1.1-.59-1.62-.93-.01 2.92.01 5.84-.02 8.75-.08 1.4-.54 2.79-1.35 3.94-1.31 1.92-3.58 3.17-5.91 3.21-1.43.08-2.86-.31-4.08-1.03-2.02-1.19-3.44-3.37-3.65-5.71-.02-.5-.03-1-.01-1.49.18-1.9 1.12-3.72 2.58-4.96 1.66-1.44 3.98-2.13 6.15-1.72.02 1.48-.04 2.96-.04 4.44-.99-.32-2.15-.23-3.02.37-.63.41-1.11 1.04-1.36 1.75-.21.51-.15 1.07-.14 1.61.24 1.64 1.82 3.02 3.5 2.87 1.12-.01 2.19-.66 2.77-1.61.19-.33.4-.67.41-1.06.1-1.79.06-3.57.07-5.36.01-4.03-.01-8.05.02-12.07z" />
+                    </svg>
+                </a>
+            </div>
+            <div class="footer-bottom">
+                <p>© 2569 Ocean Moon Seafood Co., Ltd. สงวนลิขสิทธิ์ทุกประการ</p>
+            </div>
+        </div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+
+</html>
